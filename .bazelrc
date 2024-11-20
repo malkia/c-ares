@@ -1,0 +1,2 @@
+common --experimental_convenience_symlinks=clean
+try-import %workspace%/../top.bazelrc
