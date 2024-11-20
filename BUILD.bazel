@@ -98,11 +98,15 @@ config_setting(
     values = {"cpu": "openbsd"},
 )
 
-copy_file(
-    name = "ares_build_h",
-    src = "//grpc/third_party/cares:ares_build.h",
-    out = "include/ares_build.h",
-)
+# This works from here, but trying to compile from another repo gives
+# ERROR: Q:/b/u/c56xnmzt/external/c-ares+/BUILD.bazel:162:11: Compiling src/lib/ares_conn.c failed: undeclared inclusion(s
+# this rule is missing dependency declarations for the following files included by 'src/lib/ares_conn.c':
+#  'bazel-out/x64_windows-dbg/bin/external/c-ares+/ares_build.h'
+# copy_file(
+#     name = "ares_build_h",
+#     src = "//grpc/third_party/cares:ares_build.h",
+#     out = "include/ares_build.h",
+# )
 
 copy_file(
     name = "ares_config_h",
