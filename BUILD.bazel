@@ -1,179 +1,30 @@
-load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
-
-config_setting(
-    name = "darwin",
-    values = {"cpu": "darwin"},
-)
-
-config_setting(
-    name = "darwin_x86_64",
-    values = {"cpu": "darwin_x86_64"},
-)
-
-config_setting(
-    name = "darwin_arm64",
-    values = {"cpu": "darwin_arm64"},
-)
-
-config_setting(
-    name = "darwin_arm64e",
-    values = {"cpu": "darwin_arm64e"},
-)
-
-config_setting(
-    name = "windows",
-    values = {"cpu": "x64_windows"},
-)
-
-# Android is not officially supported through C++.
-# This just helps with the build for now.
-config_setting(
-    name = "android",
-    values = {"crosstool_top": "//external:android/crosstool"},
-    # TODO: Use constraint_values to detect android after Bazel 7.0 platforms migration is finished
-    # constraint_values = [ "@platforms//os:android" ],
-)
-
-# iOS is not officially supported through C++.
-# This just helps with the build for now.
-config_setting(
-    name = "ios_x86_64",
-    values = {"cpu": "ios_x86_64"},
-)
-
-config_setting(
-    name = "ios_armv7",
-    values = {"cpu": "ios_armv7"},
-)
-
-config_setting(
-    name = "ios_armv7s",
-    values = {"cpu": "ios_armv7s"},
-)
-
-config_setting(
-    name = "ios_arm64",
-    values = {"cpu": "ios_arm64"},
-)
-
-config_setting(
-    name = "ios_sim_arm64",
-    values = {"cpu": "ios_sim_arm64"},
-)
-
-# The following architectures are found in 
-# https://github.com/bazelbuild/bazel/blob/master/src/main/java/com/google/devtools/build/lib/rules/apple/ApplePlatform.java
-config_setting(
-    name = "tvos_x86_64",
-    values = {"cpu": "tvos_x86_64"},
-)
-
-config_setting(
-    name = "tvos_arm64",
-    values = {"cpu": "tvos_arm64"}
-)
-
-config_setting(
-    name = "watchos_i386",
-    values = {"cpu": "watchos_i386"},
-)
-
-config_setting(
-    name = "watchos_x86_64",
-    values = {"cpu": "watchos_x86_64"}
-)
-
-config_setting(
-    name = "watchos_armv7k",
-    values = {"cpu": "watchos_armv7k"},
-)
-
-config_setting(
-    name = "watchos_arm64_32",
-    values = {"cpu": "watchos_arm64_32"}
-)
-
-config_setting(
-    name = "openbsd",
-    values = {"cpu": "openbsd"},
-)
-
-# This works from here, but trying to compile from another repo gives
-# ERROR: Q:/b/u/c56xnmzt/external/c-ares+/BUILD.bazel:162:11: Compiling src/lib/ares_conn.c failed: undeclared inclusion(s
-# this rule is missing dependency declarations for the following files included by 'src/lib/ares_conn.c':
-#  'bazel-out/x64_windows-dbg/bin/external/c-ares+/ares_build.h'
-# copy_file(
-#     name = "ares_build_h",
-#     src = "//grpc/third_party/cares:ares_build.h",
-#     out = "include/ares_build.h",
-# )
-
-copy_file(
-    name = "ares_config_h",
-    src = select({
-        ":ios_x86_64": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":ios_armv7": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":ios_armv7s": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":ios_arm64": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":ios_sim_arm64": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":tvos_x86_64": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":tvos_arm64": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":watchos_i386": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":watchos_x86_64": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":watchos_armv7k": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":watchos_arm64_32": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":darwin": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":darwin_x86_64": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":darwin_arm64": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":darwin_arm64e": "//grpc/third_party/cares:config_darwin/ares_config.h",
-        ":windows": "//grpc/third_party/cares:config_windows/ares_config.h",
-        ":android": "//grpc/third_party/cares:config_android/ares_config.h",
-        ":openbsd": "//grpc/third_party/cares:config_openbsd/ares_config.h",
-        "//conditions:default": "//grpc/third_party/cares:config_linux/ares_config.h",
-    }),
-    out = "include/ares_config.h",
-)
+# TODO: Bring back other platforms, this was hard-coded for Windows
 
 cc_library(
-    name = "ares_config",
-    hdrs = [
-        "include/ares_config.h"
-    ],
-    strip_include_prefix = "include",
-    defines = select({
-        "windows": [],
-        "//conditions:default": [
-            "_GNU_SOURCE",
-            "HAVE_CONFIG_H=1",
-        ],
-    }) + ["CARES_STATICLIB"],
-)
-
-cc_library(
-    name = "ares_api",
+    name = "ares",
+    # This should not be propagated, as other libraries might pick it up and complain (like curl with curl_config.h)
+    local_defines = ["HAVE_CONFIG_H"],
     hdrs = [
         "include/ares.h",
+        "include/ares_config.h",
         "include/ares_build.h",
         "include/ares_dns.h",
         "include/ares_dns_record.h",
         "include/ares_nameser.h",
         "include/ares_version.h",
     ],
+    # This then have to be propagated, as anyone including above hdrs would expect it
+    defines = ["CARES_STATICLIB"],
+    # For whoever uses this library, pretend the "include" is not there.
     strip_include_prefix = "include",
-    deps = [":ares_config"],
-)
-
-cc_library(
-    name = "ares",
-    deps = [":ares_api"],
     srcs = glob(["src/lib/**/*.c", "src/lib/**/*.h",]),
     includes = [
+        "include",
         "src/lib/include",
         "src/lib",
     ],
-    strip_include_prefix = "src/lib",
     linkopts = select({
-        ":windows": [
+        "@platforms//os:windows": [
             "-defaultlib:ws2_32.lib",
             "-defaultlib:Iphlpapi.lib",
             "-defaultlib:advapi32.lib",
@@ -183,7 +34,6 @@ cc_library(
     visibility = [
         "//visibility:public",
     ],
-    alwayslink = 1,
 )
 
 cc_library(
