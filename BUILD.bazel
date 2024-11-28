@@ -1,19 +1,50 @@
+package(
+    default_visibility = ["//visibility:public"],
+    features = [
+        # Causes issues with ares_config.h or ares_build.h trying to parse windows/linux on both platforms
+        "-parse_headers",
+    ],
+)
+
+LOCAL_DEFINES = [
+    "HAVE_CONFIG_H",
+    "_GNU_SOURCE",
+]
+
 cc_library(
     name = "ares",
-    srcs = glob([
-        "src/lib/**/*.c",
-        "src/lib/**/*.h",
-    ]),
+    srcs = glob(
+               [
+                   "src/lib/**/*.c",
+                   "src/lib/**/*.h",
+               ],
+               exclude = ["src/lib/ares_config_*"],
+           ) +
+           select({
+               "@platforms//os:windows": [
+                   "src/lib/ares_config_windows.h",
+               ],
+               "@platforms//os:linux": [
+                   "src/lib/ares_config_linux.h",
+               ],
+               "//conditions:default": [],
+           }),
     hdrs = [
         "include/ares.h",
         "include/ares_build.h",
-        "include/ares_build_linux.h",
-        "include/ares_build_windows.h",
         "include/ares_dns.h",
         "include/ares_dns_record.h",
         "include/ares_nameser.h",
         "include/ares_version.h",
-    ],
+    ] + select({
+        "@platforms//os:windows": [
+            "include/ares_build_windows.h",
+        ],
+        "@platforms//os:linux": [
+            "include/ares_build_linux.h",
+        ],
+        "//conditions:default": [],
+    }),
     defines = ["CARES_STATICLIB"],
     includes = [
         "include",
@@ -28,7 +59,7 @@ cc_library(
         ],
         "//conditions:default": [],
     }),
-    local_defines = ["HAVE_CONFIG_H"],
+    local_defines = LOCAL_DEFINES,
     strip_include_prefix = "include",
     visibility = [
         "//visibility:public",
@@ -39,13 +70,14 @@ cc_library(
     name = "ares_getopt",
     srcs = ["src/tools/ares_getopt.c"],
     hdrs = ["src/tools/ares_getopt.h"],
+    local_defines = LOCAL_DEFINES,
     strip_include_prefix = "src/tools",
 )
 
 cc_binary(
     name = "ahost",
     srcs = ["src/tools/ahost.c"],
-    local_defines = ["HAVE_CONFIG_H"],
+    local_defines = LOCAL_DEFINES,
     deps = [
         ":ares",
         ":ares_getopt",
@@ -55,7 +87,7 @@ cc_binary(
 cc_binary(
     name = "adig",
     srcs = ["src/tools/adig.c"],
-    local_defines = ["HAVE_CONFIG_H"],
+    local_defines = LOCAL_DEFINES,
     deps = [
         ":ares",
         ":ares_getopt",
