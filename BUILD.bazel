@@ -1,27 +1,24 @@
-# TODO: Bring back other platforms, this was hard-coded for Windows
-
 cc_library(
     name = "ares",
-    # This should not be propagated, as other libraries might pick it up and complain (like curl with curl_config.h)
-    local_defines = ["HAVE_CONFIG_H"],
+    srcs = glob([
+        "src/lib/**/*.c",
+        "src/lib/**/*.h",
+    ]),
     hdrs = [
         "include/ares.h",
-        "include/ares_config.h",
         "include/ares_build.h",
+        "include/ares_build_linux.h",
+        "include/ares_build_windows.h",
         "include/ares_dns.h",
         "include/ares_dns_record.h",
         "include/ares_nameser.h",
         "include/ares_version.h",
     ],
-    # This then have to be propagated, as anyone including above hdrs would expect it
     defines = ["CARES_STATICLIB"],
-    # For whoever uses this library, pretend the "include" is not there.
-    strip_include_prefix = "include",
-    srcs = glob(["src/lib/**/*.c", "src/lib/**/*.h",]),
     includes = [
         "include",
-        "src/lib/include",
         "src/lib",
+        "src/lib/include",
     ],
     linkopts = select({
         "@platforms//os:windows": [
@@ -31,6 +28,8 @@ cc_library(
         ],
         "//conditions:default": [],
     }),
+    local_defines = ["HAVE_CONFIG_H"],
+    strip_include_prefix = "include",
     visibility = [
         "//visibility:public",
     ],
@@ -46,11 +45,19 @@ cc_library(
 cc_binary(
     name = "ahost",
     srcs = ["src/tools/ahost.c"],
-    deps = [":ares", ":ares_getopt"],
+    local_defines = ["HAVE_CONFIG_H"],
+    deps = [
+        ":ares",
+        ":ares_getopt",
+    ],
 )
 
 cc_binary(
     name = "adig",
     srcs = ["src/tools/adig.c"],
-    deps = [":ares", ":ares_getopt"],
+    local_defines = ["HAVE_CONFIG_H"],
+    deps = [
+        ":ares",
+        ":ares_getopt",
+    ],
 )

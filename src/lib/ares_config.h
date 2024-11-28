@@ -1,9 +1,9 @@
 #pragma once
 
 #if defined(_WIN32)
-#include "ares_build_windows.h"
+#include "ares_config_windows.h"
 #endif
 
 #if defined(__linux__)
-#include "ares_build_linux.h"
+#include "ares_config_linux.h"
 #endif
