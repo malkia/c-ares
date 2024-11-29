@@ -27,6 +27,9 @@ cc_library(
                "@platforms//os:linux": [
                    "src/lib/ares_config_linux.h",
                ],
+               "@platforms//os:macos": [
+                   "src/lib/ares_config_macos.h",
+               ],
                "//conditions:default": [],
            }),
     hdrs = [
@@ -42,6 +45,9 @@ cc_library(
         ],
         "@platforms//os:linux": [
             "include/ares_build_linux.h",
+        ],
+        "@platforms//os:macos": [
+            "include/ares_build_macos.h",
         ],
         "//conditions:default": [],
     }),

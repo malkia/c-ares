@@ -7,3 +7,7 @@
 #if defined(__linux__)
 #include "ares_config_linux.h"
 #endif
+
+#if defined(__APPLE__)
+#include "ares_config_macos.h"
+#endif
