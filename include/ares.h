@@ -116,7 +116,9 @@ extern "C" {
 #    endif
 #  endif
 #else
-#  if defined(__GNUC__) && __GNUC__ >= 4
+#  ifdef CARES_STATICLIB
+#    define CARES_EXTERN
+#  elif defined(__GNUC__) && __GNUC__ >= 4
 #    define CARES_EXTERN __attribute__((visibility("default")))
 #  elif defined(__INTEL_COMPILER) && __INTEL_COMPILER >= 900
 #    define CARES_EXTERN __attribute__((visibility("default")))

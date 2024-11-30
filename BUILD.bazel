@@ -57,14 +57,6 @@ cc_library(
         "src/lib",
         "src/lib/include",
     ],
-    linkopts = select({
-        "@platforms//os:windows": [
-            "-defaultlib:ws2_32.lib",
-            "-defaultlib:Iphlpapi.lib",
-            "-defaultlib:advapi32.lib",
-        ],
-        "//conditions:default": [],
-    }),
     local_defines = LOCAL_DEFINES,
     strip_include_prefix = "include",
     visibility = [
