@@ -91,3 +91,36 @@ cc_binary(
         ":ares_getopt",
     ],
 )
+
+cc_library(
+    name = "test_sources",
+    testonly = 1,
+    srcs = glob([
+        "test/ares-test-*.cc",
+        "test/dns-proto*.cc",
+    ]),
+    hdrs = [
+        "test/ares-test.h",
+        "test/ares-test-ai.h",
+        "test/dns-proto.h",
+    ],
+    includes = ["test"],
+    # We can push these for tests
+    defines = LOCAL_DEFINES,
+    deps = [
+        ":ares",
+        "@googletest//:gtest",
+    ],
+)
+
+cc_test(
+    name = "tests",
+    srcs = ["test/ares-test.cc"],
+    args = [
+        "--gtest_filter=-*LiveSearchTXT*:*LiveSearchANY*:*LiveSearchA*",
+    ],
+    deps = [
+        ":test_sources",
+        "@googletest//:gtest_main",
+    ],
+)
