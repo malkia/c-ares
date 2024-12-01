@@ -11,6 +11,11 @@ LOCAL_DEFINES = [
     "_GNU_SOURCE",
 ]
 
+alias(
+    name = "c-ares",
+    actual = ":ares",
+)
+
 cc_library(
     name = "ares",
     srcs = glob(
@@ -104,9 +109,9 @@ cc_library(
         "test/ares-test-ai.h",
         "test/dns-proto.h",
     ],
-    includes = ["test"],
     # We can push these for tests
     defines = LOCAL_DEFINES,
+    includes = ["test"],
     deps = [
         ":ares",
         "@googletest//:gtest",
@@ -115,6 +120,7 @@ cc_library(
 
 cc_test(
     name = "tests",
+    shard_count = 32,
     srcs = ["test/ares-test.cc"],
     args = [
         "--gtest_filter=-*LiveSearchTXT*:*LiveSearchANY*:*LiveSearchA*",
@@ -122,5 +128,77 @@ cc_test(
     deps = [
         ":test_sources",
         "@googletest//:gtest_main",
+    ],
+)
+
+filegroup(
+    name = "fuzz_input",
+    srcs = glob(["test/fuzzinput/**/*"]),
+)
+
+filegroup(
+    name = "fuzz_names",
+    srcs = glob(["test/fuzznames/**/*"]),
+)
+
+cc_test(
+    name = "fuzz_tests",
+    srcs = [
+        "test/ares-fuzz.c",
+        "test/ares-test-fuzz.c",
+    ],
+    args = [
+        "$(locations :fuzz_input)",
+    ],
+    data = [":fuzz_input"],
+    deps = [
+        ":ares",
+    ],
+)
+
+cc_test(
+    name = "fuzz_name_tests",
+    srcs = [
+        "test/ares-fuzz.c",
+        "test/ares-test-fuzz-name.c",
+    ],
+    args = [
+        "$(locations :fuzz_names)",
+    ],
+    data = [":fuzz_names"],
+    deps = [
+        ":ares",
+    ],
+)
+
+cc_test(
+    name = "dns_dump_tests",
+    defines = LOCAL_DEFINES,
+    srcs = [
+        "test/dns-dump.cc",
+        "test/dns-proto.cc",
+        "test/dns-proto.h",
+    ],
+    args = [
+        "$(location test/fuzzinput/answer_a)",
+        "$(location test/fuzzinput/answer_aaaa)",
+    ],
+    data = [
+        "test/fuzzinput/answer_a",
+        "test/fuzzinput/answer_aaaa",
+    ],
+    deps = [
+        ":ares",
+    ],
+)
+
+cc_binary(
+    name = "query_loop",
+    testonly = 1,
+    srcs = [
+        "test/ares_queryloop.c",
+    ],
+    deps = [
+        ":ares",
     ],
 )
