@@ -8,6 +8,7 @@ package(
 
 LOCAL_DEFINES = [
     "HAVE_CONFIG_H",
+    "HAVE_OVERLAPPED_ENTRY",
     "_GNU_SOURCE",
 ]
 

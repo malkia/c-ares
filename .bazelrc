@@ -1,2 +1,6 @@
 common --experimental_convenience_symlinks=clean
 try-import %workspace%/../top.bazelrc
+
+mod --charset=ascii
+mod --include_builtin --include_unused --verbose --extension_info=all
+
