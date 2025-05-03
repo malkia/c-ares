@@ -1,6 +1,12 @@
 common --experimental_convenience_symlinks=clean
 try-import %workspace%/../top.bazelrc
+common --enable_platform_specific_config
 
-mod --charset=ascii
-mod --include_builtin --include_unused --verbose --extension_info=all
+# Set minimum supported C++ version
+build:macos --host_copt=-std=c++17 --copt=-std=c++17
+build:linux --host_copt=-std=c++17 --copt=-std=c++17
+build:windows --host_copt=/std:c++17 --copt=/std:c++17
+
+mod --charset=ascii 
+# mod --include_builtin --include_unused --verbose --extension_info=all
 
