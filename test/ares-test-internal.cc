@@ -600,6 +600,18 @@ TEST_F(FileChannelTest, GetAddrInfoHostsIPV6) {
   EXPECT_EQ("{ipv6.com addr=[[0000:0000:0000:0000:0000:0000:0000:0001]]}", ss.str());
 }
 
+TEST_F(FileChannelTest, GetAddrInfoInvalidService) {
+  TempFile hostsfile("1.2.3.4 example.com");
+  EnvValue with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints{};
+  AddrInfoResult result{};
+  hints.ai_family = AF_INET;
+  hints.ai_flags = ARES_AI_CANONNAME | ARES_AI_ENVHOSTS | ARES_AI_NOSORT;
+  ares_getaddrinfo(channel_, "example.com", "invalid", &hints, AddrInfoCallback, &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  EXPECT_EQ(result.status_, ARES_ESERVICE);
+}
 
 TEST_F(FileChannelTest, GetAddrInfoAllocFail) {
   TempFile hostsfile("1.2.3.4 example.com alias1 alias2\n");
@@ -657,7 +669,12 @@ TEST_F(LibraryTest, DNSRecord) {
   /* A */
   EXPECT_EQ(ARES_SUCCESS,
     ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ANSWER, "example.com",
-      ARES_REC_TYPE_A, ARES_CLASS_IN, 300));
+      ARES_REC_TYPE_A, ARES_CLASS_IN, 600));
+
+  EXPECT_EQ(600, ares_dns_rr_get_ttl(rr));
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_rr_set_ttl(rr, 300));
+  EXPECT_EQ(300, ares_dns_rr_get_ttl(rr));
+
   EXPECT_LT(0, ares_inet_pton(AF_INET, "1.1.1.1", &addr));
   EXPECT_EQ(ARES_SUCCESS,
     ares_dns_rr_set_addr(rr, ARES_RR_A_ADDR, &addr));
@@ -1061,6 +1078,7 @@ TEST_F(LibraryTest, DNSRecord) {
   EXPECT_EQ(0, (int)ares_dns_rr_get_type(NULL));
   EXPECT_EQ(0, (int)ares_dns_rr_get_class(NULL));
   EXPECT_EQ(0, ares_dns_rr_get_ttl(NULL));
+  EXPECT_NE(ARES_SUCCESS, ares_dns_rr_set_ttl(NULL, 100));
   EXPECT_NE(ARES_SUCCESS, ares_dns_write(NULL, NULL, NULL));
 #ifndef CARES_SYMBOL_HIDING
   ares_dns_record_ttl_decrement(NULL, 0);
