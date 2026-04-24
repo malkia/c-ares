@@ -514,6 +514,7 @@ static ares_status_t ares_dns_parse_rr_opt(ares_buf_t *buf, ares_dns_rr_t *rr,
 
     status = ares_dns_rr_set_opt_own(rr, ARES_RR_OPT_OPTIONS, opt, val, len);
     if (status != ARES_SUCCESS) {
+      ares_free(val);
       return status;
     }
   }
@@ -607,6 +608,7 @@ static ares_status_t ares_dns_parse_rr_svcb(ares_buf_t *buf, ares_dns_rr_t *rr,
 
     status = ares_dns_rr_set_opt_own(rr, ARES_RR_SVCB_PARAMS, opt, val, len);
     if (status != ARES_SUCCESS) {
+      ares_free(val);
       return status;
     }
   }
@@ -658,6 +660,7 @@ static ares_status_t ares_dns_parse_rr_https(ares_buf_t *buf, ares_dns_rr_t *rr,
 
     status = ares_dns_rr_set_opt_own(rr, ARES_RR_HTTPS_PARAMS, opt, val, len);
     if (status != ARES_SUCCESS) {
+      ares_free(val);
       return status;
     }
   }
@@ -765,19 +768,18 @@ static ares_status_t ares_dns_parse_rr_raw_rr(ares_buf_t    *buf,
   ares_status_t  status;
   unsigned char *bytes = NULL;
 
+  /* Can't fail */
+  status = ares_dns_rr_set_u16(rr, ARES_RR_RAW_RR_TYPE, raw_type);
+  if (status != ARES_SUCCESS) {
+    return status;
+  }
+
   if (rdlength == 0) {
     return ARES_SUCCESS;
   }
 
   status = ares_buf_fetch_bytes_dup(buf, rdlength, ARES_FALSE, &bytes);
   if (status != ARES_SUCCESS) {
-    return status;
-  }
-
-  /* Can't fail */
-  status = ares_dns_rr_set_u16(rr, ARES_RR_RAW_RR_TYPE, raw_type);
-  if (status != ARES_SUCCESS) {
-    ares_free(bytes);
     return status;
   }
 
@@ -919,30 +921,6 @@ static ares_status_t ares_dns_parse_header(ares_buf_t *buf, unsigned int flags,
   }
 
   (*dnsrec)->raw_rcode = rcode;
-
-  if (*ancount > 0) {
-    status =
-      ares_dns_record_rr_prealloc(*dnsrec, ARES_SECTION_ANSWER, *ancount);
-    if (status != ARES_SUCCESS) {
-      goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
-    }
-  }
-
-  if (*nscount > 0) {
-    status =
-      ares_dns_record_rr_prealloc(*dnsrec, ARES_SECTION_AUTHORITY, *nscount);
-    if (status != ARES_SUCCESS) {
-      goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
-    }
-  }
-
-  if (*arcount > 0) {
-    status =
-      ares_dns_record_rr_prealloc(*dnsrec, ARES_SECTION_ADDITIONAL, *arcount);
-    if (status != ARES_SUCCESS) {
-      goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
-    }
-  }
 
   return ARES_SUCCESS;
 
@@ -1208,6 +1186,8 @@ static ares_status_t ares_dns_parse_buf(ares_buf_t *buf, unsigned int flags,
                                         ares_dns_record_t **dnsrec)
 {
   ares_status_t  status;
+  size_t         total_rr_count;
+  const size_t   min_rr_wire_len = 11;
   unsigned short qdcount;
   unsigned short ancount;
   unsigned short nscount;
@@ -1265,6 +1245,35 @@ static ares_status_t ares_dns_parse_buf(ares_buf_t *buf, unsigned int flags,
     status = ares_dns_parse_qd(buf, *dnsrec);
     if (status != ARES_SUCCESS) {
       goto fail;
+    }
+  }
+
+  total_rr_count = (size_t)ancount + (size_t)nscount + (size_t)arcount;
+  if (total_rr_count > ares_buf_len(buf) / min_rr_wire_len) {
+    status = ARES_EBADRESP;
+    goto fail;
+  }
+
+  if (ancount > 0) {
+    status = ares_dns_record_rr_prealloc(*dnsrec, ARES_SECTION_ANSWER, ancount);
+    if (status != ARES_SUCCESS) {
+      goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
+    }
+  }
+
+  if (nscount > 0) {
+    status =
+      ares_dns_record_rr_prealloc(*dnsrec, ARES_SECTION_AUTHORITY, nscount);
+    if (status != ARES_SUCCESS) {
+      goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
+    }
+  }
+
+  if (arcount > 0) {
+    status =
+      ares_dns_record_rr_prealloc(*dnsrec, ARES_SECTION_ADDITIONAL, arcount);
+    if (status != ARES_SUCCESS) {
+      goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
     }
   }
 

@@ -207,6 +207,17 @@ TEST_F(LibraryTest, ParseFullyCompressedName) {
   ares_free_hostent(host);
 }
 
+TEST_F(LibraryTest, ParseMalformedRRCount) {
+  ares_dns_record_t *dnsrec = NULL;
+  const unsigned char data[] = {
+    0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x01, 'a',  0x00, 0x00,
+    0x01, 0x00, 0x01,
+  };
+
+  EXPECT_EQ(ARES_EBADRESP, ares_dns_parse(data, sizeof(data), 0, &dnsrec));
+  EXPECT_EQ(nullptr, dnsrec);
+}
 
 }  // namespace test
 }  // namespace ares
