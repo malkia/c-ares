@@ -44,7 +44,7 @@ static int          ares_init_flags;
  * should never call malloc(0) so lets return NULL so we're more likely to find
  * an issue if it were to occur. */
 
-static void        *default_malloc(size_t size)
+static void *default_malloc(size_t size)
 {
   if (size == 0) {
     return NULL;
@@ -103,6 +103,27 @@ void *ares_realloc_zero(void *ptr, size_t orig_size, size_t new_size)
   }
 
   return p;
+}
+
+void *ares_malloc_zero_array(size_t num, size_t size)
+{
+  size_t total;
+  if (ares_size_t_mul_overflow(num, size, &total)) {
+    return NULL;
+  }
+  return ares_malloc_zero(total);
+}
+
+void *ares_realloc_zero_array(void *ptr, size_t orig_num, size_t new_num,
+                              size_t size)
+{
+  size_t orig_total;
+  size_t new_total;
+  if (ares_size_t_mul_overflow(orig_num, size, &orig_total) ||
+      ares_size_t_mul_overflow(new_num, size, &new_total)) {
+    return NULL;
+  }
+  return ares_realloc_zero(ptr, orig_total, new_total);
 }
 
 int ares_library_init(int flags)

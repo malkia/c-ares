@@ -26,6 +26,8 @@
 #include "ares-test.h"
 #include "dns-proto.h"
 
+#include <climits>
+#include <cstdint>
 #include <stdio.h>
 
 #ifdef HAVE_UNISTD_H
@@ -46,6 +48,8 @@ extern "C" {
 #include "ares_inet_net_pton.h"
 #include "ares_data.h"
 #include "str/ares_strsplit.h"
+#include "ares_punycode.h"
+#include "str/ares_idnamap.h"
 #include "dsa/ares_htable.h"
 
 #ifdef HAVE_ARPA_INET_H
@@ -83,6 +87,40 @@ TEST_F(LibraryTest, StringLengthWithoutNullTerminator) {
   for(size_t i = 0; i < data.length(); ++i) {
     EXPECT_EQ(ares_strnlen(data.c_str(), i), i);
   }
+}
+
+TEST_F(LibraryTest, StrParseUint) {
+  unsigned int v = 42;
+
+  EXPECT_TRUE(ares_str_parse_uint("0", 128, &v));
+  EXPECT_EQ(0u, v);
+  EXPECT_TRUE(ares_str_parse_uint("128", 128, &v));
+  EXPECT_EQ(128u, v);
+
+  // Exactly UINT_MAX is accepted (the interesting boundary: on a 32-bit
+  // unsigned long it parses to ULONG_MAX without ERANGE).
+  EXPECT_TRUE(ares_str_parse_uint("4294967295", UINT_MAX, &v));
+  EXPECT_EQ(UINT_MAX, v);
+
+  // max == 0 permits only "0".
+  EXPECT_TRUE(ares_str_parse_uint("0", 0, &v));
+  EXPECT_EQ(0u, v);
+
+  // Failure leaves *out untouched.
+  v = 42;
+  EXPECT_FALSE(ares_str_parse_uint("1", 0, &v));
+  EXPECT_EQ(42u, v);
+  EXPECT_FALSE(ares_str_parse_uint("129", 128, &v));
+  EXPECT_EQ(42u, v);
+
+  EXPECT_FALSE(ares_str_parse_uint("4294967296", UINT_MAX, &v)); // over on LP64
+  EXPECT_FALSE(ares_str_parse_uint("12x", UINT_MAX, &v));        // trailing
+  EXPECT_FALSE(ares_str_parse_uint("0x10", UINT_MAX, &v));       // trailing hex
+  EXPECT_FALSE(ares_str_parse_uint(" 5", UINT_MAX, &v));         // leading space
+  EXPECT_FALSE(ares_str_parse_uint("+5", UINT_MAX, &v));         // leading sign
+  EXPECT_FALSE(ares_str_parse_uint("-1", UINT_MAX, &v));         // sign wrap
+  EXPECT_FALSE(ares_str_parse_uint("", UINT_MAX, &v));
+  EXPECT_FALSE(ares_str_parse_uint(NULL, UINT_MAX, &v));
 }
 
 void CheckPtoN4(int size, unsigned int value, const char *input) {
@@ -472,6 +510,696 @@ TEST_F(LibraryTest, URI) {
   EXPECT_NE(ARES_SUCCESS, ares_uri_parse_buf(NULL, NULL));
   EXPECT_NE(ARES_SUCCESS, ares_uri_parse_buf(NULL, NULL));
 }
+
+TEST_F(LibraryTest, PUNYCODE) {
+  struct {
+    const char *input;
+    const char *output;
+  } tests[] = {
+    { "www.google.com",      "www.google.com"                   },
+    { "www.bücher.com",      "www.xn--bcher-kva.com"            },
+    { "www.büücher.com",     "www.xn--bcher-kvaa.com"           },
+    { "www.bücüher.com",     "www.xn--bcher-kvab.com"           },
+    { "www.bücherü.com",     "www.xn--bcher-kvae.com"           },
+    { "www.ýbücher.com",     "www.xn--bcher-kvaf.com"           },
+    { "www.übücher.com",     "www.xn--bcher-jvab.com"           },
+    { "www.München.com",     "www.xn--Mnchen-3ya.com"           },
+    { "www.München-Ost.com", "www.xn--Mnchen-Ost-9db.com"       },
+    { "bücher.München.com",  "xn--bcher-kva.xn--Mnchen-3ya.com" },
+    { "www.abæcdöef.com",    "www.xn--abcdef-qua4k.com"         },
+    { "www.правда.com",      "www.xn--80aafi6cg.com"            },
+    { "www.ยจฆฟคฏข.com",     "www.xn--22cdfh1b8fsa.com"         },
+    { "www.도메인.com",        "www.xn--hq1bm8jm9l.com"           },
+    { "www.ドメイン名例.com",  "www.xn--eckwd4c7cu47r2wf.com"     },
+    /* Supplementary plane codepoint exercising 4-byte UTF-8 in both
+     * directions: U+10348 GOTHIC LETTER HWAIR */
+    { "\xF0\x90\x8D\x88.com", "xn--2c8c.com"                     },
+    /* Trailing dot (fully-qualified) round-trips */
+    { "www.bücher.com.",     "www.xn--bcher-kva.com."           },
+    /* RFC 3492 Section 7.1 sample strings (as single-label domains) */
+    /* (B) Chinese (simplified) */
+    { "他们为什么不说中文",
+      "xn--ihqwcrb4cv8a8dqg056pqjye"                             },
+    /* (C) Chinese (traditional) */
+    { "他們爲什麽不說中文",
+      "xn--ihqwctvzc91f659drss3x8bo0yb"                          },
+    /* (D) Czech */
+    { "Pročprostěnemluvíčesky",
+      "xn--Proprostnemluvesky-uyb24dma41a"                       },
+    /* (E) Hebrew */
+    { "למההםפשוטלאמדבריםעברית",
+      "xn--4dbcagdahymbxekheh6e0a7fei0b"                         },
+    /* (G) Japanese */
+    { "なぜみんな日本語を話してくれないのか",
+      "xn--n8jok5ay5dzabd5bym9f0cm5685rrjetr6pdxa"               },
+    /* (I) Russian */
+    { "почемужеонинеговорятпорусски",
+      "xn--b1abfaaepdrnnbgefbadotcwatmq2g4l"                     },
+    /* (K) Vietnamese */
+    { "TạisaohọkhôngthểchỉnóitiếngViệt",
+      "xn--TisaohkhngthchnitingVit-kjcr8268qyxafd2f1b9g"         },
+    /* (L) Japanese title with digits in the basic codepoint segment */
+    { "3年B組金八先生",
+      "xn--3B-ww4c5e180e575a65lsy2b"                             },
+    { NULL, NULL }
+  };
+  size_t i;
+
+  for (i=0; tests[i].input != NULL; i++) {
+    ares_status_t status;
+    char *encoded = NULL;
+    char *decoded = NULL;
+
+    if (verbose) std::cerr << "Testing " << tests[i].input << std::endl;
+    status = ares_punycode_encode_domain(tests[i].input, &encoded);
+    EXPECT_EQ(ARES_SUCCESS, status);
+
+    if (status == ARES_SUCCESS) {
+      EXPECT_STREQ(tests[i].output, encoded);
+
+      status = ares_punycode_decode_domain(tests[i].output, &decoded);
+      EXPECT_EQ(ARES_SUCCESS, status);
+
+      EXPECT_STREQ(tests[i].input, decoded);
+    }
+    ares_free(decoded);
+    ares_free(encoded);
+  }
+
+  /* The ACE prefix is case-insensitive on decode as per RFC 5890 */
+  {
+    char *decoded = NULL;
+    EXPECT_EQ(ARES_SUCCESS,
+              ares_punycode_decode_domain("XN--FSQ.com", &decoded));
+    EXPECT_STREQ("例.com", decoded);
+    ares_free(decoded);
+    decoded = NULL;
+    EXPECT_EQ(ARES_SUCCESS,
+              ares_punycode_decode_domain("Xn--fsq.com", &decoded));
+    EXPECT_STREQ("例.com", decoded);
+    ares_free(decoded);
+  }
+
+  /* Empty domains trivially round-trip */
+  {
+    char *out = NULL;
+    EXPECT_EQ(ARES_SUCCESS, ares_punycode_encode_domain("", &out));
+    EXPECT_STREQ("", out);
+    ares_free(out);
+    out = NULL;
+    EXPECT_EQ(ARES_SUCCESS, ares_punycode_decode_domain("", &out));
+    EXPECT_STREQ("", out);
+    ares_free(out);
+  }
+
+  /* Invalid tests  */
+  EXPECT_NE(ARES_SUCCESS, ares_punycode_encode_domain(NULL, NULL));
+  EXPECT_NE(ARES_SUCCESS, ares_punycode_encode_domain("www.bücher.com", NULL));
+
+  /* Invalid UTF-8 must be rejected, not decoded to garbage */
+  struct {
+    const char *input;
+    const char *descr;
+  } invalid_utf8[] = {
+    { "www.b\xC3.com",             "truncated 2-byte sequence"          },
+    { "www.b\xC3\x28.com",         "invalid continuation byte"          },
+    { "www.b\xC0\xAF.com",         "overlong encoding"                  },
+    { "www.b\xED\xA0\x80.com",     "UTF-16 surrogate half"              },
+    { "www.b\xF4\x90\x80\x80.com", "codepoint beyond U+10FFFF"          },
+    { "www.b\xF0\x9F\x98",         "truncated 4-byte sequence at end"   },
+    { "www.b\xFF.com",             "invalid lead byte"                  },
+    { NULL, NULL }
+  };
+  for (i=0; invalid_utf8[i].input != NULL; i++) {
+    char *encoded = NULL;
+    if (verbose) std::cerr << "Testing " << invalid_utf8[i].descr << std::endl;
+    EXPECT_NE(ARES_SUCCESS,
+              ares_punycode_encode_domain(invalid_utf8[i].input, &encoded))
+      << invalid_utf8[i].descr;
+    ares_free(encoded);
+  }
+
+  /* Invalid punycode decode must error, not emit invalid unicode */
+  struct {
+    const char *input;
+    const char *descr;
+  } invalid_puny[] = {
+    { "xn--999999999",   "overflow"                          },
+    { "xn--a-b!c",       "invalid punycode digit"            },
+    { "xn--a-rc4g",      "decodes to a UTF-16 surrogate half" },
+    { "xn--9",           "truncated variable-length integer" },
+    /* RFC 3492 Section 6.2: the delimiter is only consumed when more than
+     * zero basic codepoints precede it; a leading '-' is part of the
+     * extended string and is not a valid digit */
+    { "xn---baa",        "leading delimiter, no basic codepoints" },
+    /* An encoded label longer than the 63 octet DNS limit is rejected
+     * before any decode work is performed */
+    { "xn--aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "encoded label exceeds 63 octets" },
+    { NULL, NULL }
+  };
+  for (i=0; invalid_puny[i].input != NULL; i++) {
+    char *decoded = NULL;
+    if (verbose) std::cerr << "Testing " << invalid_puny[i].descr << std::endl;
+    EXPECT_NE(ARES_SUCCESS,
+              ares_punycode_decode_domain(invalid_puny[i].input, &decoded))
+      << invalid_puny[i].descr;
+    ares_free(decoded);
+  }
+
+  /* Malformed punycode is ARES_EBADNAME specifically: a truncated
+   * variable-length integer must not leak the buf layer's ARES_EBADRESP */
+  {
+    char *decoded = NULL;
+    EXPECT_EQ(ARES_EBADNAME, ares_punycode_decode_domain("xn--9", &decoded));
+    ares_free(decoded);
+  }
+
+  /* A label whose encoded form exceeds the 63 octet DNS limit is rejected */
+  {
+    std::string toolong;
+    char       *encoded = NULL;
+    for (i = 0; i < 60; i++) {
+      toolong += "ü";
+    }
+    toolong += ".com";
+    EXPECT_EQ(ARES_EBADNAME,
+              ares_punycode_encode_domain(toolong.c_str(), &encoded));
+    ares_free(encoded);
+  }
+}
+
+TEST_F(LibraryTest, IDNA) {
+  struct {
+    ares_status_t status;
+    const char   *input;
+    const char   *output;
+    const char   *descr;
+  } tests[] = {
+    /* No-op for plain ascii */
+    { ARES_SUCCESS,  "www.example.com",   "www.example.com",
+      "plain ascii" },
+    /* ASCII is lowercased for canonical form */
+    { ARES_SUCCESS,  "WWW.EXAMPLE.COM",   "www.example.com",
+      "ascii lowercased" },
+    /* Unicode casefolding is applied before punycode (unlike the raw
+     * punycode API which preserves case) */
+    { ARES_SUCCESS,  "www.München.com",   "www.xn--mnchen-3ya.com",
+      "unicode casefold" },
+    /* Ignored codepoints are removed: U+00AD SOFT HYPHEN.  Spelled in
+     * explicit bytes since the raw codepoint is invisible: an editor
+     * silently stripping it would leave this case testing nothing */
+    { ARES_SUCCESS,  "exam\xC2\xADple.com", "example.com",
+      "soft hyphen ignored" },
+    /* Label separator variants map to '.': U+3002 IDEOGRAPHIC FULL STOP */
+    { ARES_SUCCESS,  "例。com",       "xn--fsq.com",
+      "ideographic full stop" },
+    /* Deviation characters are valid in nontransitional processing */
+    { ARES_SUCCESS,  "faß.de",            "xn--fa-hia.de",
+      "sharp s deviation" },
+    /* Multi-codepoint compatibility mappings must not be truncated:
+     * U+2167 ROMAN NUMERAL EIGHT maps to 'viii' (4 codepoints) */
+    { ARES_SUCCESS,  "Ⅷ.example.com",     "viii.example.com",
+      "roman numeral viii" },
+    /* U+2152 VULGAR FRACTION ONE TENTH maps to '1⁄10' (4 codepoints,
+     * including non-ascii U+2044 FRACTION SLASH which is disallowed) */
+    { ARES_EBADNAME, "⅒.example.com",     NULL,
+      "vulgar fraction one tenth" },
+    /* Underscore is in widespread DNS use and must pass through even
+     * though the IDNA2008 NV8 exclusions would reject it */
+    { ARES_SUCCESS,  "_dmarc.bücher.com", "_dmarc.xn--bcher-kva.com",
+      "underscore passthrough" },
+    /* Disallowed codepoints are rejected: U+FFFD REPLACEMENT CHARACTER */
+    { ARES_EBADNAME, "exam�ple.com", NULL,
+      "replacement char disallowed" },
+    /* Emoji are excluded by IDNA2008 (NV8).  U+1F600 is spelled in explicit
+     * UTF-8 bytes: MSVC without /utf-8 mangles \U escapes beyond the
+     * Windows-1252 execution charset into '?' */
+    { ARES_EBADNAME, "\xF0\x9F\x98\x80.com", NULL,
+      "emoji disallowed" },
+    /* An already-encoded label is ASCII and passes through unmodified, no
+     * double-encoding */
+    { ARES_SUCCESS,  "xn--bcher-kva.de",  "xn--bcher-kva.de",
+      "already encoded passthrough" },
+    /* Fullwidth characters map to their ASCII equivalents, lowercased:
+     * U+FF21..U+FF23 FULLWIDTH LATIN CAPITAL LETTER A..C */
+    { ARES_SUCCESS,  "ＡＢＣ.com",         "abc.com",
+      "fullwidth mapped to ascii" },
+    /* ZWNJ (U+200C) is a deviation codepoint kept by nontransitional
+     * processing; CheckJoiners (ContextJ) is documented as not implemented
+     * so it is accepted context-free */
+    { ARES_SUCCESS,  "a\xE2\x80\x8C" "b.com", "xn--ab-j1t.com",
+      "zwnj nontransitional" },
+    /* Blank labels pass through for downstream validation to see */
+    { ARES_SUCCESS,  "bücher..de",        "xn--bcher-kva..de",
+      "empty interior label preserved" },
+    { ARES_SUCCESS,  ".",                 ".",
+      "root dot" },
+    /* A label reduced to nothing by ignored codepoints (here U+00AD SOFT
+     * HYPHEN, in explicit bytes) can never form a valid DNS label and is
+     * rejected -- unlike the blank labels present in the input above */
+    { ARES_EBADNAME, "a.\xC2\xAD.b",      NULL,
+      "label of only ignored codepoints" },
+    { ARES_EBADNAME, "\xC2\xAD",          NULL,
+      "domain of only ignored codepoints" },
+    { ARES_SUCCESS,  NULL, NULL, NULL }
+  };
+  size_t i;
+
+  for (i=0; tests[i].input != NULL; i++) {
+    ares_status_t status;
+    char         *encoded = NULL;
+
+    if (verbose) std::cerr << "Testing " << tests[i].descr << std::endl;
+    status = ares_idna_encode_domain(tests[i].input, &encoded);
+    EXPECT_EQ(tests[i].status, status) << tests[i].descr;
+    if (status == ARES_SUCCESS && tests[i].output != NULL) {
+      EXPECT_STREQ(tests[i].output, encoded) << tests[i].descr;
+    }
+    ares_free(encoded);
+  }
+
+  /* Empty domain trivially round-trips */
+  {
+    char *out = NULL;
+    EXPECT_EQ(ARES_SUCCESS, ares_idna_encode_domain("", &out));
+    EXPECT_STREQ("", out);
+    ares_free(out);
+  }
+
+  EXPECT_NE(ARES_SUCCESS, ares_idna_encode_domain(NULL, NULL));
+  EXPECT_NE(ARES_SUCCESS, ares_idna_encode_domain("www.bücher.com", NULL));
+}
+
+TEST_F(LibraryTest, IDNAAllocFail) {
+  int ii;
+
+  /* Every allocation point in the idna/punycode path must fail cleanly with
+   * ARES_ENOMEM (ASAN/LSAN CI verifies no leak at any failure point) */
+  for (ii = 1; ii <= 30; ii++) {
+    char         *out = NULL;
+    ares_status_t status;
+
+    ClearFails();
+    SetAllocFail(ii);
+    status = ares_idna_encode_domain("bücher.München.example", &out);
+    if (status == ARES_SUCCESS) {
+      EXPECT_STREQ("xn--bcher-kva.xn--mnchen-3ya.example", out);
+    } else {
+      EXPECT_EQ(ARES_ENOMEM, status) << "attempt " << ii;
+    }
+    ares_free(out);
+  }
+}
+
+/* Structural validation of the generated UTS #46 mapping table.  The
+ * generator constructs pool references so they are in bounds by design;
+ * this catches any regeneration drift or hand-editing before it can reach
+ * the runtime lookup */
+TEST_F(LibraryTest, IDNAMapTable) {
+  size_t i;
+
+  EXPECT_GT(ares_idnamap_data_len, (size_t)0);
+  EXPECT_GT(ares_idnamap_data_pool_len, (size_t)0);
+
+  for (i = 0; i < ares_idnamap_data_len; i++) {
+    const ares_idnamap_data_t *e = &ares_idnamap_data[i];
+
+    /* Well-formed range, within unicode, sorted and non-overlapping */
+    EXPECT_LE(e->code_min, e->code_max) << "entry " << i;
+    EXPECT_LE(e->code_max, (unsigned int)0x10FFFF) << "entry " << i;
+    if (i > 0) {
+      EXPECT_GT(e->code_min, ares_idnamap_data[i - 1].code_max)
+        << "entry " << i;
+    }
+
+    switch (e->status) {
+      case ARES_IDNAMAP_STATUS_MAPPED:
+        /* Pool reference must be in bounds and decode as valid UTF-8 */
+        EXPECT_GT((unsigned int)e->map_len, (unsigned int)0) << "entry " << i;
+        ASSERT_LE((size_t)e->map_offset + e->map_len,
+                  ares_idnamap_data_pool_len)
+          << "entry " << i;
+        {
+          ares_buf_t  *buf = ares_buf_create_const(
+            &ares_idnamap_data_pool[e->map_offset], e->map_len);
+          unsigned int cp = 0;
+
+          ASSERT_NE(nullptr, buf);
+          while (ares_buf_len(buf) > 0) {
+            EXPECT_EQ(ARES_SUCCESS, ares_buf_fetch_codepoint(buf, &cp))
+              << "entry " << i;
+            if (HasFailure()) {
+              break;
+            }
+          }
+          ares_buf_destroy(buf);
+        }
+        break;
+      case ARES_IDNAMAP_STATUS_DISALLOWED:
+      case ARES_IDNAMAP_STATUS_IGNORED:
+        EXPECT_EQ(0, e->map_len) << "entry " << i;
+        EXPECT_EQ((unsigned int)0, e->map_offset) << "entry " << i;
+        break;
+      default:
+        ADD_FAILURE() << "entry " << i << " has invalid status "
+                      << (int)e->status;
+        break;
+    }
+  }
+}
+
+TEST_F(LibraryTest, SysConfigDomainsIDNA) {
+  ares_sysconfig_t sysconfig;
+  memset(&sysconfig, 0, sizeof(sysconfig));
+
+  /* Mixed list: ascii stays untouched, unicode is converted to punycode,
+   * and an unconvertible entry (disallowed emoji) is dropped without
+   * affecting the rest */
+  sysconfig.domains = ares_strsplit(
+    "first.com bücher.de \xF0\x9F\x98\x80.com münchen.example", " ",
+    &sysconfig.ndomains);
+  ASSERT_NE(nullptr, sysconfig.domains);
+  ASSERT_EQ((size_t)4, sysconfig.ndomains);
+
+  EXPECT_EQ(ARES_SUCCESS, ares_sysconfig_domains_idna(&sysconfig));
+  ASSERT_EQ((size_t)3, sysconfig.ndomains);
+  EXPECT_STREQ("first.com", sysconfig.domains[0]);
+  EXPECT_STREQ("xn--bcher-kva.de", sysconfig.domains[1]);
+  EXPECT_STREQ("xn--mnchen-3ya.example", sysconfig.domains[2]);
+
+  ares_strsplit_free(sysconfig.domains, sysconfig.ndomains);
+
+  /* Unconvertible entries are dropped regardless of position (first and
+   * last here, middle above) */
+  memset(&sysconfig, 0, sizeof(sysconfig));
+  sysconfig.domains = ares_strsplit(
+    "\xF0\x9F\x98\x80.com first.com bücher.de \xF0\x9F\x98\x80.org", " ",
+    &sysconfig.ndomains);
+  ASSERT_NE(nullptr, sysconfig.domains);
+  ASSERT_EQ((size_t)4, sysconfig.ndomains);
+
+  EXPECT_EQ(ARES_SUCCESS, ares_sysconfig_domains_idna(&sysconfig));
+  ASSERT_EQ((size_t)2, sysconfig.ndomains);
+  EXPECT_STREQ("first.com", sysconfig.domains[0]);
+  EXPECT_STREQ("xn--bcher-kva.de", sysconfig.domains[1]);
+
+  ares_strsplit_free(sysconfig.domains, sysconfig.ndomains);
+
+  /* If every entry is unconvertible the array itself must be released,
+   * otherwise ares_sysconfig_apply() would fail on the empty list and skip
+   * applying the rest of the configuration */
+  memset(&sysconfig, 0, sizeof(sysconfig));
+  sysconfig.domains =
+    ares_strsplit("\xF0\x9F\x98\x80.com \xF0\x9F\x98\x80.de", " ",
+                  &sysconfig.ndomains);
+  ASSERT_NE(nullptr, sysconfig.domains);
+  ASSERT_EQ((size_t)2, sysconfig.ndomains);
+
+  EXPECT_EQ(ARES_SUCCESS, ares_sysconfig_domains_idna(&sysconfig));
+  EXPECT_EQ((size_t)0, sysconfig.ndomains);
+  EXPECT_EQ(nullptr, sysconfig.domains);
+
+  /* Empty list is a no-op */
+  memset(&sysconfig, 0, sizeof(sysconfig));
+  EXPECT_EQ(ARES_SUCCESS, ares_sysconfig_domains_idna(&sysconfig));
+  EXPECT_EQ((size_t)0, sysconfig.ndomains);
+
+  /* An entry unprintable due to an embedded control byte rather than
+   * unicode is unchanged by IDNA encoding (ASCII passes through) and is
+   * dropped as unusable.  Built by hand: ares_strsplit() itself rejects
+   * control bytes, but not every config source goes through it */
+  memset(&sysconfig, 0, sizeof(sysconfig));
+  sysconfig.domains =
+    (char **)ares_malloc_zero(sizeof(*sysconfig.domains) * 2);
+  ASSERT_NE(nullptr, sysconfig.domains);
+  sysconfig.domains[0] = ares_strdup("f\x01oo.example.com");
+  sysconfig.domains[1] = ares_strdup("first.com");
+  ASSERT_NE(nullptr, sysconfig.domains[0]);
+  ASSERT_NE(nullptr, sysconfig.domains[1]);
+  sysconfig.ndomains = 2;
+
+  EXPECT_EQ(ARES_SUCCESS, ares_sysconfig_domains_idna(&sysconfig));
+  ASSERT_EQ((size_t)1, sysconfig.ndomains);
+  EXPECT_STREQ("first.com", sysconfig.domains[0]);
+
+  ares_strsplit_free(sysconfig.domains, sysconfig.ndomains);
+
+  /* Full resolv.conf line parse path: unicode search values survive line
+   * parsing and are converted by the idna pass */
+  {
+    ares_channel_t *channel = nullptr;
+    std::string     line    = "search bücher.de first.com";
+    ares_buf_t     *buf     = ares_buf_create_const(
+      (const unsigned char *)line.c_str(), line.size());
+
+    ASSERT_NE(nullptr, buf);
+    EXPECT_EQ(ARES_SUCCESS, ares_init(&channel));
+
+    memset(&sysconfig, 0, sizeof(sysconfig));
+    EXPECT_EQ(ARES_SUCCESS,
+              ares_sysconfig_parse_resolv_line(channel, &sysconfig, buf));
+    ASSERT_EQ((size_t)2, sysconfig.ndomains);
+    EXPECT_STREQ("bücher.de", sysconfig.domains[0]);
+    EXPECT_STREQ("first.com", sysconfig.domains[1]);
+
+    EXPECT_EQ(ARES_SUCCESS, ares_sysconfig_domains_idna(&sysconfig));
+    ASSERT_EQ((size_t)2, sysconfig.ndomains);
+    EXPECT_STREQ("xn--bcher-kva.de", sysconfig.domains[0]);
+    EXPECT_STREQ("first.com", sysconfig.domains[1]);
+
+    ares_strsplit_free(sysconfig.domains, sysconfig.ndomains);
+    ares_buf_destroy(buf);
+    ares_destroy(channel);
+  }
+}
+
+TEST_F(LibraryTest, BufCharset) {
+  struct {
+    ares_bool_t ascii_ok;
+    ares_bool_t utf8_ok;
+    const char *data;
+    const char *descr;
+  } tests[] = {
+    { ARES_TRUE,  ARES_TRUE,  "plain ascii",         "printable ascii"     },
+    { ARES_FALSE, ARES_TRUE,  "b\xC3\xBC" "cher",    "2-byte utf8"         },
+    { ARES_FALSE, ARES_TRUE,  "b\xE4\xBE\x8B",       "3-byte utf8"         },
+    { ARES_FALSE, ARES_TRUE,  "b\xF0\x9F\x98\x80",   "4-byte utf8"         },
+    { ARES_FALSE, ARES_FALSE, "b\xC3",               "truncated sequence"  },
+    { ARES_FALSE, ARES_FALSE, "b\xC3\x28",           "bad continuation"    },
+    { ARES_FALSE, ARES_FALSE, "b\xC0\xAF",           "overlong encoding"   },
+    { ARES_FALSE, ARES_FALSE, "b\xED\xA0\x80",       "surrogate half"      },
+    { ARES_FALSE, ARES_FALSE, "b\xFF",               "invalid lead byte"   },
+    { ARES_FALSE, ARES_FALSE, "b\x01",               "non-printable ascii" },
+    { ARES_FALSE, ARES_FALSE, "b\x7F",               "ascii del"           },
+    { ARES_FALSE, ARES_FALSE, NULL, NULL }
+  };
+  size_t i;
+  size_t c;
+
+  for (i = 0; tests[i].data != NULL; i++) {
+    for (c = 0; c < 2; c++) {
+      ares_buf_charset_t charset =
+        (c == 0) ? ARES_BUF_CHARSET_ASCII : ARES_BUF_CHARSET_UTF8;
+      ares_bool_t   expect_ok = (c == 0) ? tests[i].ascii_ok : tests[i].utf8_ok;
+      size_t        data_len  = strlen(tests[i].data);
+      ares_buf_t   *buf;
+      char          strbuf[64];
+      char         *str = NULL;
+      ares_status_t status;
+
+      if (verbose) std::cerr << "Testing " << tests[i].descr
+                             << " charset " << (int)charset << std::endl;
+
+      /* ares_buf_fetch_str_dup() */
+      buf = ares_buf_create_const((const unsigned char *)tests[i].data,
+                                  data_len);
+      ASSERT_NE(nullptr, buf);
+      status = ares_buf_fetch_str_dup(buf, data_len, &str, charset);
+      EXPECT_EQ(expect_ok ? ARES_TRUE : ARES_FALSE,
+                (status == ARES_SUCCESS) ? ARES_TRUE : ARES_FALSE)
+        << tests[i].descr << " fetch_str_dup charset " << (int)charset;
+      if (status == ARES_SUCCESS) {
+        EXPECT_STREQ(tests[i].data, str);
+      } else {
+        EXPECT_EQ(ARES_EBADSTR, status)
+          << tests[i].descr << " fetch_str_dup charset " << (int)charset;
+      }
+      ares_free(str);
+      str = NULL;
+      ares_buf_destroy(buf);
+
+      /* ares_buf_tag_fetch_string() and ares_buf_tag_fetch_strdup() */
+      buf = ares_buf_create_const((const unsigned char *)tests[i].data,
+                                  data_len);
+      ASSERT_NE(nullptr, buf);
+      ares_buf_tag(buf);
+      ares_buf_consume(buf, data_len);
+
+      status = ares_buf_tag_fetch_string(buf, strbuf, sizeof(strbuf), charset);
+      EXPECT_EQ(expect_ok ? ARES_TRUE : ARES_FALSE,
+                (status == ARES_SUCCESS) ? ARES_TRUE : ARES_FALSE)
+        << tests[i].descr << " tag_fetch_string charset " << (int)charset;
+      if (status == ARES_SUCCESS) {
+        EXPECT_STREQ(tests[i].data, strbuf);
+      } else {
+        EXPECT_EQ(ARES_EBADSTR, status)
+          << tests[i].descr << " tag_fetch_string charset " << (int)charset;
+      }
+
+      status = ares_buf_tag_fetch_strdup(buf, &str, charset);
+      EXPECT_EQ(expect_ok ? ARES_TRUE : ARES_FALSE,
+                (status == ARES_SUCCESS) ? ARES_TRUE : ARES_FALSE)
+        << tests[i].descr << " tag_fetch_strdup charset " << (int)charset;
+      if (status == ARES_SUCCESS) {
+        EXPECT_STREQ(tests[i].data, str);
+      } else {
+        EXPECT_EQ(ARES_EBADSTR, status)
+          << tests[i].descr << " tag_fetch_strdup charset " << (int)charset;
+      }
+      ares_free(str);
+      str = NULL;
+      ares_buf_destroy(buf);
+    }
+  }
+}
+
+TEST_F(LibraryTest, BufCodepoint) {
+  /* Encode boundaries for each UTF-8 sequence length, plus invalid scalar
+   * values, verified byte-exact and round-tripped through the decoder */
+  struct {
+    unsigned int cp;
+    const char  *utf8; /* NULL = not a valid scalar value, must be rejected */
+  } tests[] = {
+    { 0x41,     "A"                },
+    { 0x7F,     "\x7F"             },
+    { 0x80,     "\xC2\x80"         },
+    { 0x7FF,    "\xDF\xBF"         },
+    { 0x800,    "\xE0\xA0\x80"     },
+    { 0xD7FF,   "\xED\x9F\xBF"     },
+    { 0xE000,   "\xEE\x80\x80"     },
+    { 0xFFFF,   "\xEF\xBF\xBF"     },
+    { 0x10000,  "\xF0\x90\x80\x80" },
+    { 0x10FFFF, "\xF4\x8F\xBF\xBF" },
+    { 0xD800,   NULL               },
+    { 0xDFFF,   NULL               },
+    { 0x110000, NULL               },
+  };
+  size_t i;
+
+  for (i = 0; i < sizeof(tests) / sizeof(*tests); i++) {
+    ares_buf_t   *buf = ares_buf_create();
+    ares_status_t status;
+    char         *str = NULL;
+    size_t        len = 0;
+
+    ASSERT_NE(nullptr, buf);
+    status = ares_buf_append_codepoint(buf, tests[i].cp);
+
+    if (tests[i].utf8 == NULL) {
+      EXPECT_EQ(ARES_EBADSTR, status) << "codepoint 0x" << std::hex
+                                      << tests[i].cp;
+      ares_buf_destroy(buf);
+      continue;
+    }
+
+    ASSERT_EQ(ARES_SUCCESS, status) << "codepoint 0x" << std::hex
+                                    << tests[i].cp;
+
+    str = ares_buf_finish_str(buf, &len);
+    buf = NULL;
+    ASSERT_NE(nullptr, str);
+    EXPECT_EQ(strlen(tests[i].utf8), len);
+    EXPECT_STREQ(tests[i].utf8, str);
+
+    /* Round-trip through the decoder */
+    {
+      ares_buf_t  *rbuf = ares_buf_create_const((const unsigned char *)str,
+                                                len);
+      unsigned int cp   = 0;
+
+      ASSERT_NE(nullptr, rbuf);
+      EXPECT_EQ(ARES_SUCCESS, ares_buf_fetch_codepoint(rbuf, &cp));
+      EXPECT_EQ(tests[i].cp, cp);
+      EXPECT_EQ((size_t)0, ares_buf_len(rbuf));
+      ares_buf_destroy(rbuf);
+    }
+    ares_free(str);
+  }
+
+  /* ares_buf_len_utf8() counts codepoints, not bytes */
+  {
+    const char *data = "a\xC3\xBC\xE4\xBE\x8B\xF0\x9F\x98\x80"; /* aü例😀 */
+    ares_buf_t *buf  = ares_buf_create_const((const unsigned char *)data,
+                                             strlen(data));
+    size_t      cnt  = 0;
+
+    ASSERT_NE(nullptr, buf);
+    EXPECT_EQ(ARES_SUCCESS, ares_buf_len_utf8(buf, &cnt));
+    EXPECT_EQ((size_t)4, cnt);
+    ares_buf_destroy(buf);
+  }
+
+  /* ares_buf_consume_last_charset() semantics */
+  {
+    ares_buf_t *buf =
+      ares_buf_create_const((const unsigned char *)"abc-def", 7);
+    size_t      n;
+
+    ASSERT_NE(nullptr, buf);
+    /* Found: consumes up to (not including) the last matching character */
+    n = ares_buf_consume_last_charset(buf, (const unsigned char *)"-", 1,
+                                      ARES_TRUE);
+    EXPECT_EQ((size_t)3, n);
+    EXPECT_EQ((size_t)4, ares_buf_len(buf)); /* "-def" remains */
+    /* Not found, required: SIZE_MAX and nothing is consumed */
+    n = ares_buf_consume_last_charset(buf, (const unsigned char *)"@", 1,
+                                      ARES_TRUE);
+    EXPECT_EQ(SIZE_MAX, n);
+    EXPECT_EQ((size_t)4, ares_buf_len(buf));
+    /* Not found, not required: consumes the remainder */
+    n = ares_buf_consume_last_charset(buf, (const unsigned char *)"@", 1,
+                                      ARES_FALSE);
+    EXPECT_EQ((size_t)4, n);
+    EXPECT_EQ((size_t)0, ares_buf_len(buf));
+    /* Empty buffer: SIZE_MAX when required, 0 otherwise */
+    n = ares_buf_consume_last_charset(buf, (const unsigned char *)"@", 1,
+                                      ARES_TRUE);
+    EXPECT_EQ(SIZE_MAX, n);
+    n = ares_buf_consume_last_charset(buf, (const unsigned char *)"@", 1,
+                                      ARES_FALSE);
+    EXPECT_EQ((size_t)0, n);
+    ares_buf_destroy(buf);
+  }
+
+  /* ares_buf_isprint() */
+  {
+    ares_buf_t *buf = ares_buf_create_const((const unsigned char *)"abc", 3);
+    ASSERT_NE(nullptr, buf);
+    EXPECT_EQ(ARES_TRUE, ares_buf_isprint(buf));
+    ares_buf_destroy(buf);
+    buf = ares_buf_create_const((const unsigned char *)"a\x01" "c", 3);
+    ASSERT_NE(nullptr, buf);
+    EXPECT_EQ(ARES_FALSE, ares_buf_isprint(buf));
+    ares_buf_destroy(buf);
+  }
+
+  /* ARES_BUF_SPLIT_UTF8 (via ares_strsplit): a single invalid element fails
+   * the entire split rather than dropping only that element, in contrast to
+   * the drop-individually semantics of the sysconfig IDNA pass */
+  {
+    size_t n   = 0;
+    char **out = ares_strsplit("good.com b\xFF" "ad.com", " ", &n);
+    EXPECT_EQ(nullptr, out);
+    out = ares_strsplit("good.com bücher.de", " ", &n);
+    ASSERT_NE(nullptr, out);
+    EXPECT_EQ((size_t)2, n);
+    EXPECT_STREQ("good.com", out[0]);
+    EXPECT_STREQ("bücher.de", out[1]);
+    ares_strsplit_free(out, n);
+  }
+}
+
 #endif /* !CARES_SYMBOL_HIDING */
 
 TEST_F(LibraryTest, InetPtoN) {
@@ -598,6 +1326,208 @@ TEST_F(FileChannelTest, GetAddrInfoHostsIPV6) {
   std::stringstream ss;
   ss << result.ai_;
   EXPECT_EQ("{ipv6.com addr=[[0000:0000:0000:0000:0000:0000:0000:0001]]}", ss.str());
+}
+
+// Regression for #1049: hostnames merged into a single entry only because they
+// share an ip address must not leak each other's *other* addresses (forward
+// lookup) or appear as each other's aliases (address-scoped cnames).  Here
+// mullvad-no-svg shares 10.124.2.38 with mullvad-no (which drags in the whole
+// group), but must resolve to only 10.124.2.38, and mullvad-no-osl (no shared
+// address) must not be reported as an alias.
+TEST_F(FileChannelTest, GetAddrInfoHostsSharedIPNoLeak)
+{
+  TempFile                   hostsfile("10.124.0.6   mullvad-no\n"
+                                       "10.124.0.108 mullvad-no\n"
+                                       "10.124.2.38  mullvad-no\n"
+                                       "10.124.0.6   mullvad-no-osl\n"
+                                       "10.124.0.108 mullvad-no-osl\n"
+                                       "10.124.2.38  mullvad-no-svg\n");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints  = { 0, 0, 0, 0 };
+  AddrInfoResult             result = {};
+  hints.ai_family                   = AF_INET;
+  hints.ai_flags = ARES_AI_CANONNAME | ARES_AI_ENVHOSTS | ARES_AI_NOSORT;
+  ares_getaddrinfo(channel_, "mullvad-no-svg", NULL, &hints, AddrInfoCallback,
+                   &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  std::stringstream ss;
+  ss << result.ai_;
+  EXPECT_EQ("{mullvad-no-svg->mullvad-no addr=[10.124.2.38]}", ss.str());
+}
+
+// The legitimate multi-address case still returns all of a hostname's own
+// addresses (mullvad-no genuinely has three).
+TEST_F(FileChannelTest, GetAddrInfoHostsMultiAddressPreserved)
+{
+  TempFile                   hostsfile("10.124.0.6   mullvad-no\n"
+                                       "10.124.0.108 mullvad-no\n"
+                                       "10.124.2.38  mullvad-no\n"
+                                       "10.124.0.6   mullvad-no-osl\n"
+                                       "10.124.0.108 mullvad-no-osl\n"
+                                       "10.124.2.38  mullvad-no-svg\n");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints  = { 0, 0, 0, 0 };
+  AddrInfoResult             result = {};
+  hints.ai_family                   = AF_INET;
+  hints.ai_flags                    = ARES_AI_NOSORT | ARES_AI_ENVHOSTS;
+  ares_getaddrinfo(channel_, "mullvad-no", NULL, &hints, AddrInfoCallback,
+                   &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  std::stringstream ss;
+  ss << result.ai_;
+  EXPECT_EQ("{addr=[10.124.0.6], addr=[10.124.0.108], addr=[10.124.2.38]}",
+            ss.str());
+}
+
+// Regression for #1049: a "bridge" line whose ip already belongs to one
+// hostname and whose hostname already belongs to another must NOT drop the
+// address.  Here mullvad-no-svg appears with 10.124.2.38 and with 10.64.0.1
+// (a line that also lists mullvad).  Both addresses must be returned; the old
+// merged store silently dropped 10.64.0.1.
+TEST_F(FileChannelTest, GetAddrInfoHostsBridgeFallback)
+{
+  TempFile                   hostsfile("10.64.0.1 mullvad\n"
+                                       "10.124.2.38 mullvad-no-svg\n"
+                                       "10.64.0.1 mullvad-no-svg\n");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints  = { 0, 0, 0, 0 };
+  AddrInfoResult             result = {};
+  hints.ai_family                   = AF_INET;
+  hints.ai_flags = ARES_AI_CANONNAME | ARES_AI_ENVHOSTS | ARES_AI_NOSORT;
+  ares_getaddrinfo(channel_, "mullvad-no-svg", NULL, &hints, AddrInfoCallback,
+                   &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  std::stringstream ss;
+  ss << result.ai_;
+  EXPECT_EQ("{mullvad->mullvad-no-svg addr=[10.124.2.38], addr=[10.64.0.1]}",
+            ss.str());
+}
+
+// A shared ip chains hostnames together, but a forward lookup must return only
+// the addresses the queried name actually appeared with.  c shares 1.1.1.1
+// with a (which owns only 1.1.1.1) and has its own 3.3.3.3; b's 2.2.2.2 must
+// not leak in.
+TEST_F(FileChannelTest, GetAddrInfoHostsChain)
+{
+  TempFile                   hostsfile("1.1.1.1 a\n"
+                                       "2.2.2.2 b\n"
+                                       "1.1.1.1 c\n"
+                                       "3.3.3.3 c\n");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints  = { 0, 0, 0, 0 };
+  AddrInfoResult             result = {};
+  hints.ai_family                   = AF_INET;
+  hints.ai_flags = ARES_AI_CANONNAME | ARES_AI_ENVHOSTS | ARES_AI_NOSORT;
+  ares_getaddrinfo(channel_, "c", NULL, &hints, AddrInfoCallback, &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  std::stringstream ss;
+  ss << result.ai_;
+  EXPECT_EQ("{c->a addr=[1.1.1.1], addr=[3.3.3.3]}", ss.str());
+}
+
+// A hostname sharing an ip with a multi-family host must not inherit the other
+// host's address of a different family.  other shares 192.168.1.1 with host,
+// but host's 2620:1234::1 must not appear in an AF_UNSPEC lookup of other.
+TEST_F(FileChannelTest, GetAddrInfoHostsMixedFamilyNoLeak)
+{
+  TempFile                   hostsfile("192.168.1.1 host\n"
+                                       "2620:1234::1 host\n"
+                                       "192.168.1.1 other\n");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints  = { 0, 0, 0, 0 };
+  AddrInfoResult             result = {};
+  hints.ai_family                   = AF_UNSPEC;
+  hints.ai_flags = ARES_AI_CANONNAME | ARES_AI_ENVHOSTS | ARES_AI_NOSORT;
+  ares_getaddrinfo(channel_, "other", NULL, &hints, AddrInfoCallback, &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  std::stringstream ss;
+  ss << result.ai_;
+  EXPECT_EQ("{other->host addr=[192.168.1.1]}", ss.str());
+}
+
+// Hostnames are matched case-insensitively, so FooBar and foobar are the same
+// name and FOOBAR resolves to both of their addresses.
+TEST_F(FileChannelTest, GetAddrInfoHostsCaseInsensitive)
+{
+  TempFile                   hostsfile("1.1.1.1 FooBar\n"
+                                       "2.2.2.2 foobar\n");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints  = { 0, 0, 0, 0 };
+  AddrInfoResult             result = {};
+  hints.ai_family                   = AF_INET;
+  hints.ai_flags = ARES_AI_CANONNAME | ARES_AI_ENVHOSTS | ARES_AI_NOSORT;
+  ares_getaddrinfo(channel_, "FOOBAR", NULL, &hints, AddrInfoCallback, &result);
+  Process();
+  EXPECT_TRUE(result.done_);
+  std::stringstream ss;
+  ss << result.ai_;
+  EXPECT_EQ("{FooBar addr=[1.1.1.1], addr=[2.2.2.2]}", ss.str());
+}
+
+// Reverse lookup (ares_gethostbyaddr) is address-scoped: only the names that
+// appeared with the queried address, and only that address.  a (which only
+// shares 1.1.1.1 with b) must not appear when reverse-resolving 2.2.2.2.
+// gethostbyaddr uses use_env=FALSE, so configure the hosts file via
+// ARES_OPT_HOSTS_FILE on a private channel.
+TEST_F(LibraryTest, GetHostByAddrHostsFile)
+{
+  TempFile            hostsfile("1.1.1.1 a\n"
+                                "1.1.1.1 b\n"
+                                "2.2.2.2 b\n"
+                                "2.2.2.2 c\n");
+  ares_channel_t     *channel = nullptr;
+  struct ares_options opts;
+  memset(&opts, 0, sizeof(opts));
+  opts.hosts_path = strdup(hostsfile.filename());
+  int optmask     = ARES_OPT_HOSTS_FILE;
+  EXPECT_EQ(ARES_SUCCESS, ares_init_options(&channel, &opts, optmask));
+  free(opts.hosts_path);
+
+  struct in_addr addr;
+  ares_inet_pton(AF_INET, "2.2.2.2", &addr);
+  HostResult result;
+  ares_gethostbyaddr(channel, &addr, sizeof(addr), AF_INET, HostCallback,
+                     &result);
+  ProcessWork(channel, NoExtraFDs, nullptr);
+  EXPECT_TRUE(result.done_);
+  std::stringstream ss;
+  ss << result.host_;
+  EXPECT_EQ("{'b' aliases=[c] addrs=[2.2.2.2]}", ss.str());
+
+  ares_destroy(channel);
+}
+
+// Forward lookup via ares_gethostbyname (also use_env=FALSE, private channel).
+// c only appeared with 2.2.2.2; b's other address 1.1.1.1 must not leak.  The
+// canonical name is the first file-order name that shares the address (b).
+TEST_F(LibraryTest, GetHostByNameHostsFile)
+{
+  TempFile            hostsfile("1.1.1.1 a\n"
+                                "1.1.1.1 b\n"
+                                "2.2.2.2 b\n"
+                                "2.2.2.2 c\n");
+  ares_channel_t     *channel = nullptr;
+  struct ares_options opts;
+  memset(&opts, 0, sizeof(opts));
+  opts.hosts_path = strdup(hostsfile.filename());
+  int optmask     = ARES_OPT_HOSTS_FILE;
+  EXPECT_EQ(ARES_SUCCESS, ares_init_options(&channel, &opts, optmask));
+  free(opts.hosts_path);
+
+  HostResult result;
+  ares_gethostbyname(channel, "c", AF_INET, HostCallback, &result);
+  ProcessWork(channel, NoExtraFDs, nullptr);
+  EXPECT_TRUE(result.done_);
+  std::stringstream ss;
+  ss << result.host_;
+  EXPECT_EQ("{'b' aliases=[c] addrs=[2.2.2.2]}", ss.str());
+
+  ares_destroy(channel);
 }
 
 TEST_F(FileChannelTest, GetAddrInfoInvalidService) {
@@ -826,6 +1756,136 @@ TEST_F(LibraryTest, DNSRecord) {
     0x45, 0x61, 0xcb, 0x10, 0x66, 0x18, 0xe9, 0x71 };
   EXPECT_EQ(ARES_SUCCESS,
     ares_dns_rr_set_bin(rr, ARES_RR_TLSA_DATA, tlsa, sizeof(tlsa)));
+  /* DS */
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ADDITIONAL,
+      "example.com", ARES_REC_TYPE_DS, ARES_CLASS_IN, 86400));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u16(rr, ARES_RR_DS_KEY_TAG, 0x1234));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_DS_ALGORITHM,
+      ARES_DNSSEC_ALGORITHM_RSASHA256));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_DS_DIGEST_TYPE, ARES_DS_DIGEST_SHA256));
+  const unsigned char ds_digest[] = {
+    0xd2, 0xab, 0xde, 0x24, 0x0d, 0x7c, 0xd3, 0xee, 0x6b, 0x4b, 0x28, 0xc5,
+    0x4d, 0xf0, 0x34, 0xb9, 0x79, 0x83, 0xa1, 0xd1, 0x6e, 0x8a, 0x41, 0x0e,
+    0x45, 0x61, 0xcb, 0x10, 0x66, 0x18, 0xe9, 0x71 };
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_bin(rr, ARES_RR_DS_DIGEST, ds_digest, sizeof(ds_digest)));
+  /* SSHFP */
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ADDITIONAL,
+      "example.com", ARES_REC_TYPE_SSHFP, ARES_CLASS_IN, 3600));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_SSHFP_ALGORITHM,
+      ARES_SSHFP_ALGORITHM_RSA));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_SSHFP_FP_TYPE, ARES_SSHFP_FP_SHA256));
+  const unsigned char sshfp_fp[] = {
+    0xd2, 0xab, 0xde, 0x24, 0x0d, 0x7c, 0xd3, 0xee, 0x6b, 0x4b, 0x28, 0xc5,
+    0x4d, 0xf0, 0x34, 0xb9, 0x79, 0x83, 0xa1, 0xd1, 0x6e, 0x8a, 0x41, 0x0e,
+    0x45, 0x61, 0xcb, 0x10, 0x66, 0x18, 0xe9, 0x71 };
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_bin(rr, ARES_RR_SSHFP_FINGERPRINT, sshfp_fp,
+      sizeof(sshfp_fp)));
+  /* RRSIG */
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ADDITIONAL,
+      "example.com", ARES_REC_TYPE_RRSIG, ARES_CLASS_ANY, 0));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u16(rr, ARES_RR_RRSIG_TYPE_COVERED, ARES_REC_TYPE_A));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_RRSIG_ALGORITHM,
+      ARES_DNSSEC_ALGORITHM_RSASHA256));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_RRSIG_LABELS, 2));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u32(rr, ARES_RR_RRSIG_ORIGINAL_TTL, 3600));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u32(rr, ARES_RR_RRSIG_EXPIRATION,
+      (unsigned int)time(NULL)));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u32(rr, ARES_RR_RRSIG_INCEPTION,
+      (unsigned int)time(NULL) - (86400 * 365)));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u16(rr, ARES_RR_RRSIG_KEY_TAG, 0x5678));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_str(rr, ARES_RR_RRSIG_SIGNERS_NAME, "example.com"));
+  const unsigned char rrsig_sig[] = {
+    0xd2, 0xab, 0xde, 0x24, 0x0d, 0x7c, 0xd3, 0xee, 0x6b, 0x4b, 0x28, 0xc5,
+    0x4d, 0xf0, 0x34, 0xb9, 0x79, 0x83, 0xa1, 0xd1, 0x6e, 0x8a, 0x41, 0x0e,
+    0x45, 0x61, 0xcb, 0x10, 0x66, 0x18, 0xe9, 0x71 };
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_bin(rr, ARES_RR_RRSIG_SIGNATURE, rrsig_sig,
+      sizeof(rrsig_sig)));
+  /* NSEC */
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ADDITIONAL,
+      "example.com", ARES_REC_TYPE_NSEC, ARES_CLASS_IN, 86400));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_str(rr, ARES_RR_NSEC_NEXT_DOMAIN, "next.example.com"));
+  const unsigned char nsec_bitmap[] = { 0x00, 0x06, 0x40, 0x01, 0x00,
+                                        0x00, 0x00, 0x03 };
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_bin(rr, ARES_RR_NSEC_TYPE_BIT_MAPS, nsec_bitmap,
+      sizeof(nsec_bitmap)));
+  /* DNSKEY */
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ADDITIONAL,
+      "example.com", ARES_REC_TYPE_DNSKEY, ARES_CLASS_IN, 86400));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u16(rr, ARES_RR_DNSKEY_FLAGS, 257));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_DNSKEY_PROTOCOL, 3));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_DNSKEY_ALGORITHM,
+      ARES_DNSSEC_ALGORITHM_RSASHA256));
+  const unsigned char dnskey_pk[] = {
+    0xd2, 0xab, 0xde, 0x24, 0x0d, 0x7c, 0xd3, 0xee, 0x6b, 0x4b, 0x28, 0xc5,
+    0x4d, 0xf0, 0x34, 0xb9, 0x79, 0x83, 0xa1, 0xd1, 0x6e, 0x8a, 0x41, 0x0e,
+    0x45, 0x61, 0xcb, 0x10, 0x66, 0x18, 0xe9, 0x71 };
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_bin(rr, ARES_RR_DNSKEY_PUBLIC_KEY, dnskey_pk,
+      sizeof(dnskey_pk)));
+  /* NSEC3 */
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ADDITIONAL,
+      "abc123.example.com", ARES_REC_TYPE_NSEC3, ARES_CLASS_IN, 86400));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_NSEC3_HASH_ALGORITHM,
+      ARES_NSEC3_HASH_SHA1));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_NSEC3_FLAGS, 0));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u16(rr, ARES_RR_NSEC3_ITERATIONS, 10));
+  const unsigned char nsec3_salt[] = { 0xaa, 0xbb, 0xcc, 0xdd };
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_bin(rr, ARES_RR_NSEC3_SALT, nsec3_salt,
+      sizeof(nsec3_salt)));
+  const unsigned char nsec3_next[] = {
+    0x0d, 0x7c, 0xd3, 0xee, 0x6b, 0x4b, 0x28, 0xc5, 0x4d, 0xf0, 0x34, 0xb9,
+    0x79, 0x83, 0xa1, 0xd1, 0x6e, 0x8a, 0x41, 0x0e };
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_bin(rr, ARES_RR_NSEC3_NEXT_HASHED_OWNER, nsec3_next,
+      sizeof(nsec3_next)));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_bin(rr, ARES_RR_NSEC3_TYPE_BIT_MAPS, nsec_bitmap,
+      sizeof(nsec_bitmap)));
+  /* NSEC3PARAM */
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ADDITIONAL,
+      "example.com", ARES_REC_TYPE_NSEC3PARAM, ARES_CLASS_IN, 0));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_NSEC3PARAM_HASH_ALGORITHM,
+      ARES_NSEC3_HASH_SHA1));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u8(rr, ARES_RR_NSEC3PARAM_FLAGS, 0));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_u16(rr, ARES_RR_NSEC3PARAM_ITERATIONS, 10));
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_rr_set_bin(rr, ARES_RR_NSEC3PARAM_SALT, nsec3_salt,
+      sizeof(nsec3_salt)));
   /* SVCB */
   EXPECT_EQ(ARES_SUCCESS,
     ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ADDITIONAL,
@@ -937,6 +1997,134 @@ TEST_F(LibraryTest, DNSRecord) {
   EXPECT_EQ(ancount, ares_dns_record_rr_cnt(dnsrec, ARES_SECTION_ANSWER));
   EXPECT_EQ(nscount, ares_dns_record_rr_cnt(dnsrec, ARES_SECTION_AUTHORITY));
   EXPECT_EQ(arcount, ares_dns_record_rr_cnt(dnsrec, ARES_SECTION_ADDITIONAL));
+
+  /* Verify record fields survived roundtrip */
+  /* DS - index 5 */
+  rr = ares_dns_record_rr_get(dnsrec, ARES_SECTION_ADDITIONAL, 5);
+  EXPECT_EQ(ARES_REC_TYPE_DS, ares_dns_rr_get_type(rr));
+  EXPECT_EQ(0x1234, ares_dns_rr_get_u16(rr, ARES_RR_DS_KEY_TAG));
+  EXPECT_EQ(ARES_DNSSEC_ALGORITHM_RSASHA256,
+    ares_dns_rr_get_u8(rr, ARES_RR_DS_ALGORITHM));
+  EXPECT_EQ(ARES_DS_DIGEST_SHA256,
+    ares_dns_rr_get_u8(rr, ARES_RR_DS_DIGEST_TYPE));
+  {
+    size_t len = 0;
+    const unsigned char *bin = ares_dns_rr_get_bin(rr, ARES_RR_DS_DIGEST, &len);
+    EXPECT_EQ(32, len);
+    EXPECT_NE(nullptr, bin);
+    EXPECT_EQ(0xd2, bin[0]);
+  }
+
+  /* SSHFP - index 6 */
+  rr = ares_dns_record_rr_get(dnsrec, ARES_SECTION_ADDITIONAL, 6);
+  EXPECT_EQ(ARES_REC_TYPE_SSHFP, ares_dns_rr_get_type(rr));
+  EXPECT_EQ(ARES_SSHFP_ALGORITHM_RSA,
+    ares_dns_rr_get_u8(rr, ARES_RR_SSHFP_ALGORITHM));
+  EXPECT_EQ(ARES_SSHFP_FP_SHA256,
+    ares_dns_rr_get_u8(rr, ARES_RR_SSHFP_FP_TYPE));
+  {
+    size_t len = 0;
+    const unsigned char *bin =
+      ares_dns_rr_get_bin(rr, ARES_RR_SSHFP_FINGERPRINT, &len);
+    EXPECT_EQ(32, len);
+    EXPECT_NE(nullptr, bin);
+    EXPECT_EQ(0xd2, bin[0]);
+  }
+
+  /* RRSIG - index 7 */
+  rr = ares_dns_record_rr_get(dnsrec, ARES_SECTION_ADDITIONAL, 7);
+  EXPECT_EQ(ARES_REC_TYPE_RRSIG, ares_dns_rr_get_type(rr));
+  EXPECT_EQ(ARES_REC_TYPE_A,
+    ares_dns_rr_get_u16(rr, ARES_RR_RRSIG_TYPE_COVERED));
+  EXPECT_EQ(ARES_DNSSEC_ALGORITHM_RSASHA256,
+    ares_dns_rr_get_u8(rr, ARES_RR_RRSIG_ALGORITHM));
+  EXPECT_EQ(2, ares_dns_rr_get_u8(rr, ARES_RR_RRSIG_LABELS));
+  EXPECT_EQ(3600, ares_dns_rr_get_u32(rr, ARES_RR_RRSIG_ORIGINAL_TTL));
+  EXPECT_EQ(0x5678, ares_dns_rr_get_u16(rr, ARES_RR_RRSIG_KEY_TAG));
+  EXPECT_STREQ("example.com",
+    ares_dns_rr_get_str(rr, ARES_RR_RRSIG_SIGNERS_NAME));
+  {
+    size_t len = 0;
+    const unsigned char *bin =
+      ares_dns_rr_get_bin(rr, ARES_RR_RRSIG_SIGNATURE, &len);
+    EXPECT_EQ(32, len);
+    EXPECT_NE(nullptr, bin);
+  }
+
+  /* NSEC - index 8 */
+  rr = ares_dns_record_rr_get(dnsrec, ARES_SECTION_ADDITIONAL, 8);
+  EXPECT_EQ(ARES_REC_TYPE_NSEC, ares_dns_rr_get_type(rr));
+  EXPECT_STREQ("next.example.com",
+    ares_dns_rr_get_str(rr, ARES_RR_NSEC_NEXT_DOMAIN));
+  {
+    size_t len = 0;
+    const unsigned char *bin =
+      ares_dns_rr_get_bin(rr, ARES_RR_NSEC_TYPE_BIT_MAPS, &len);
+    EXPECT_EQ(8, len);
+    EXPECT_NE(nullptr, bin);
+  }
+
+  /* DNSKEY - index 9 */
+  rr = ares_dns_record_rr_get(dnsrec, ARES_SECTION_ADDITIONAL, 9);
+  EXPECT_EQ(ARES_REC_TYPE_DNSKEY, ares_dns_rr_get_type(rr));
+  EXPECT_EQ(257, ares_dns_rr_get_u16(rr, ARES_RR_DNSKEY_FLAGS));
+  EXPECT_EQ(3, ares_dns_rr_get_u8(rr, ARES_RR_DNSKEY_PROTOCOL));
+  EXPECT_EQ(ARES_DNSSEC_ALGORITHM_RSASHA256,
+    ares_dns_rr_get_u8(rr, ARES_RR_DNSKEY_ALGORITHM));
+  {
+    size_t len = 0;
+    const unsigned char *bin =
+      ares_dns_rr_get_bin(rr, ARES_RR_DNSKEY_PUBLIC_KEY, &len);
+    EXPECT_EQ(32, len);
+    EXPECT_NE(nullptr, bin);
+  }
+
+  /* NSEC3 - index 10 */
+  rr = ares_dns_record_rr_get(dnsrec, ARES_SECTION_ADDITIONAL, 10);
+  EXPECT_EQ(ARES_REC_TYPE_NSEC3, ares_dns_rr_get_type(rr));
+  EXPECT_EQ(ARES_NSEC3_HASH_SHA1,
+    ares_dns_rr_get_u8(rr, ARES_RR_NSEC3_HASH_ALGORITHM));
+  EXPECT_EQ(0, ares_dns_rr_get_u8(rr, ARES_RR_NSEC3_FLAGS));
+  EXPECT_EQ(10, ares_dns_rr_get_u16(rr, ARES_RR_NSEC3_ITERATIONS));
+  {
+    size_t len = 0;
+    const unsigned char *bin =
+      ares_dns_rr_get_bin(rr, ARES_RR_NSEC3_SALT, &len);
+    EXPECT_EQ(4, len);
+    EXPECT_NE(nullptr, bin);
+    EXPECT_EQ(0xaa, bin[0]);
+  }
+  {
+    size_t len = 0;
+    const unsigned char *bin =
+      ares_dns_rr_get_bin(rr, ARES_RR_NSEC3_NEXT_HASHED_OWNER, &len);
+    EXPECT_EQ(20, len);
+    EXPECT_NE(nullptr, bin);
+    EXPECT_EQ(0x0d, bin[0]);
+  }
+  {
+    size_t len = 0;
+    const unsigned char *bin =
+      ares_dns_rr_get_bin(rr, ARES_RR_NSEC3_TYPE_BIT_MAPS, &len);
+    EXPECT_EQ(8, len);
+    EXPECT_NE(nullptr, bin);
+  }
+
+  /* NSEC3PARAM - index 11 */
+  rr = ares_dns_record_rr_get(dnsrec, ARES_SECTION_ADDITIONAL, 11);
+  EXPECT_EQ(ARES_REC_TYPE_NSEC3PARAM, ares_dns_rr_get_type(rr));
+  EXPECT_EQ(ARES_NSEC3_HASH_SHA1,
+    ares_dns_rr_get_u8(rr, ARES_RR_NSEC3PARAM_HASH_ALGORITHM));
+  EXPECT_EQ(0, ares_dns_rr_get_u8(rr, ARES_RR_NSEC3PARAM_FLAGS));
+  EXPECT_EQ(10, ares_dns_rr_get_u16(rr, ARES_RR_NSEC3PARAM_ITERATIONS));
+  {
+    size_t len = 0;
+    const unsigned char *bin =
+      ares_dns_rr_get_bin(rr, ARES_RR_NSEC3PARAM_SALT, &len);
+    EXPECT_EQ(4, len);
+    EXPECT_NE(nullptr, bin);
+    EXPECT_EQ(0xaa, bin[0]);
+  }
 
   /* Iterate and print */
   ares_buf_t *printmsg = ares_buf_create();
@@ -1105,6 +2293,195 @@ TEST_F(LibraryTest, DNSRecord) {
   EXPECT_EQ(ARES_FALSE, ares_dns_rr_get_opt_byid(NULL, ARES_RR_A_ADDR, 1, NULL, NULL));
 }
 
+TEST_F(LibraryTest, DNSNameCompression14Bit) {
+  ares_dns_record_t          *dnsrec = NULL;
+  ares_dns_rr_t              *rr     = NULL;
+  unsigned char              *msg    = NULL;
+  size_t                      msglen = 0;
+  std::vector<unsigned char>  txt(255, 'a');
+
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_create(&dnsrec, 0x1234, ARES_FLAG_QR,
+      ARES_OPCODE_QUERY, ARES_RCODE_NOERROR));
+
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_query_add(dnsrec, "example.com", ARES_REC_TYPE_ANY,
+      ARES_CLASS_IN));
+
+  /* Pad the message well past the 14-bit (16383 byte) compression pointer
+   * limit with large TXT records. */
+  for (size_t i = 0; i < 80; i++) {
+    EXPECT_EQ(ARES_SUCCESS,
+      ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ANSWER, "example.com",
+        ARES_REC_TYPE_TXT, ARES_CLASS_IN, 0));
+    EXPECT_EQ(ARES_SUCCESS,
+      ares_dns_rr_add_abin(rr, ARES_RR_TXT_DATA, txt.data(), txt.size()));
+  }
+
+  /* Past byte 16383, add a repeated owner name.  Its first occurrence lands at
+   * an offset that doesn't fit in 14 bits, so it must not be recorded as a
+   * compression target; the second occurrence must not be emitted as a pointer
+   * to (offset & 0x3FFF), which would corrupt the message.  It instead
+   * compresses only against the in-range example.com target. */
+  for (size_t i = 0; i < 2; i++) {
+    EXPECT_EQ(ARES_SUCCESS,
+      ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ANSWER,
+        "repeat.example.com", ARES_REC_TYPE_TXT, ARES_CLASS_IN, 0));
+    EXPECT_EQ(ARES_SUCCESS,
+      ares_dns_rr_add_abin(rr, ARES_RR_TXT_DATA, txt.data(), txt.size()));
+  }
+
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_write(dnsrec, &msg, &msglen));
+  EXPECT_GT(msglen, 0x3FFFU);
+
+  /* 12 hdr + 17 question + 80*268 compressed TXT + 2*275 repeat TXT.
+   * An exact size also verifies compression remains active for names
+   * below the limit. */
+  EXPECT_EQ(22019U, msglen);
+
+  /* Before the fix this parse failed / mis-parsed on the truncated pointer. */
+  ares_dns_record_t *parsed = NULL;
+  EXPECT_EQ(ARES_SUCCESS, ares_dns_parse(msg, msglen, 0, &parsed));
+  ASSERT_NE(nullptr, parsed);
+
+  size_t ancount = ares_dns_record_rr_cnt(parsed, ARES_SECTION_ANSWER);
+  EXPECT_EQ(82U, ancount);
+  const ares_dns_rr_t *last =
+    ares_dns_record_rr_get_const(parsed, ARES_SECTION_ANSWER, ancount - 1);
+  ASSERT_NE(nullptr, last);
+  EXPECT_STREQ("repeat.example.com", ares_dns_rr_get_name(last));
+
+  ares_dns_record_destroy(parsed);
+  ares_free_string(msg);
+  ares_dns_record_destroy(dnsrec);
+}
+
+#ifndef CARES_SYMBOL_HIDING
+/* Regression coverage for the zero-length salt/type-bitmap code paths in
+* NSEC3 and NSEC3PARAM (empty non-terminal / opt-out per RFC 5155 7.1),
+* which the parser represents via ares_dns_rr_set_bin_own(..., NULL, 0).
+* That internal API isn't exported from shared builds with symbol hiding
+* enabled, so this test is skipped in that configuration. */
+TEST_F(LibraryTest, DNSRecordNSEC3EmptyFields) {
+ ares_dns_record_t *dnsrec = NULL;
+ ares_dns_rr_t     *rr     = NULL;
+
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_record_create(&dnsrec, 0x1234, 0, ARES_OPCODE_QUERY,
+                           ARES_RCODE_NOERROR));
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_record_query_add(dnsrec, "example.com", ARES_REC_TYPE_NSEC3,
+                              ARES_CLASS_IN));
+
+ /* NSEC3 with empty salt and empty type bitmap. */
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ANSWER,
+     "def456.example.com", ARES_REC_TYPE_NSEC3, ARES_CLASS_IN, 86400));
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_rr_set_u8(rr, ARES_RR_NSEC3_HASH_ALGORITHM,
+     ARES_NSEC3_HASH_SHA1));
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_rr_set_u8(rr, ARES_RR_NSEC3_FLAGS, 1));
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_rr_set_u16(rr, ARES_RR_NSEC3_ITERATIONS, 10));
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_rr_set_bin_own(rr, ARES_RR_NSEC3_SALT, NULL, 0));
+ const unsigned char nsec3_next[] = {
+   0x0d, 0x7c, 0xd3, 0xee, 0x6b, 0x4b, 0x28, 0xc5, 0x4d, 0xf0, 0x34, 0xb9,
+   0x79, 0x83, 0xa1, 0xd1, 0x6e, 0x8a, 0x41, 0x0e };
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_rr_set_bin(rr, ARES_RR_NSEC3_NEXT_HASHED_OWNER, nsec3_next,
+     sizeof(nsec3_next)));
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_rr_set_bin_own(rr, ARES_RR_NSEC3_TYPE_BIT_MAPS, NULL, 0));
+
+ /* NSEC3PARAM with empty salt. */
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ANSWER,
+     "example.com", ARES_REC_TYPE_NSEC3PARAM, ARES_CLASS_IN, 0));
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_rr_set_u8(rr, ARES_RR_NSEC3PARAM_HASH_ALGORITHM,
+     ARES_NSEC3_HASH_SHA1));
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_rr_set_u8(rr, ARES_RR_NSEC3PARAM_FLAGS, 0));
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_rr_set_u16(rr, ARES_RR_NSEC3PARAM_ITERATIONS, 10));
+ EXPECT_EQ(ARES_SUCCESS,
+   ares_dns_rr_set_bin_own(rr, ARES_RR_NSEC3PARAM_SALT, NULL, 0));
+
+ /* Write and re-parse to exercise the write-side empty-length paths too. */
+ unsigned char *buf    = NULL;
+ size_t         buflen = 0;
+ EXPECT_EQ(ARES_SUCCESS, ares_dns_write(dnsrec, &buf, &buflen));
+
+ ares_dns_record_t *parsed = NULL;
+ EXPECT_EQ(ARES_SUCCESS, ares_dns_parse(buf, buflen, 0, &parsed));
+
+ rr = ares_dns_record_rr_get(parsed, ARES_SECTION_ANSWER, 0);
+ EXPECT_EQ(ARES_REC_TYPE_NSEC3, ares_dns_rr_get_type(rr));
+ {
+   size_t len = 1;
+   ares_dns_rr_get_bin(rr, ARES_RR_NSEC3_SALT, &len);
+   EXPECT_EQ((size_t)0, len);
+ }
+ {
+   size_t len = 1;
+   ares_dns_rr_get_bin(rr, ARES_RR_NSEC3_TYPE_BIT_MAPS, &len);
+   EXPECT_EQ((size_t)0, len);
+ }
+
+ rr = ares_dns_record_rr_get(parsed, ARES_SECTION_ANSWER, 1);
+ EXPECT_EQ(ARES_REC_TYPE_NSEC3PARAM, ares_dns_rr_get_type(rr));
+ {
+   size_t len = 1;
+   ares_dns_rr_get_bin(rr, ARES_RR_NSEC3PARAM_SALT, &len);
+   EXPECT_EQ((size_t)0, len);
+ }
+
+ ares_free(buf);
+ ares_dns_record_destroy(parsed);
+ ares_dns_record_destroy(dnsrec);
+}
+#endif /* !CARES_SYMBOL_HIDING */
+
+TEST_F(LibraryTest, DNSRecordRejectsInvalidBinaryInput) {
+  ares_dns_record_t *dnsrec = NULL;
+  ares_dns_rr_t     *rr     = NULL;
+  unsigned char      data[] = { 'x' };
+
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_create(&dnsrec, 0x1234, ARES_FLAG_RD,
+      ARES_OPCODE_QUERY, ARES_RCODE_NOERROR));
+
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ANSWER, "example.com",
+      ARES_REC_TYPE_TXT, ARES_CLASS_IN, 60));
+  EXPECT_EQ(ARES_ENOMEM,
+    ares_dns_rr_add_abin(rr, ARES_RR_TXT_DATA, data, SIZE_MAX));
+  EXPECT_EQ(ARES_EFORMERR,
+    ares_dns_rr_add_abin(rr, ARES_RR_TXT_DATA, NULL, 1));
+
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ANSWER, "example.com",
+      ARES_REC_TYPE_CAA, ARES_CLASS_IN, 60));
+  EXPECT_EQ(ARES_ENOMEM,
+    ares_dns_rr_set_bin(rr, ARES_RR_CAA_VALUE, data, SIZE_MAX));
+  EXPECT_EQ(ARES_EFORMERR,
+    ares_dns_rr_set_bin(rr, ARES_RR_CAA_VALUE, NULL, 1));
+  EXPECT_EQ(ARES_EFORMERR,
+    ares_dns_rr_set_bin(rr, ARES_RR_CAA_TAG, data, sizeof(data)));
+
+  EXPECT_EQ(ARES_SUCCESS,
+    ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ADDITIONAL, "",
+      ARES_REC_TYPE_OPT, ARES_CLASS_IN, 0));
+  EXPECT_EQ(ARES_ENOMEM,
+    ares_dns_rr_set_opt(rr, ARES_RR_OPT_OPTIONS, 3, data, SIZE_MAX));
+  EXPECT_EQ(ARES_EFORMERR,
+    ares_dns_rr_set_opt(rr, ARES_RR_OPT_OPTIONS, 3, NULL, 1));
+
+  ares_dns_record_destroy(dnsrec);
+}
+
 TEST_F(LibraryTest, DNSParseFlags) {
   ares_dns_record_t   *dnsrec = NULL;
   ares_dns_rr_t       *rr     = NULL;
@@ -1241,6 +2618,19 @@ TEST_F(LibraryTest, ArrayMisuse) {
   EXPECT_NE(ARES_SUCCESS, ares_array_remove_last(NULL));
   EXPECT_NE(ARES_SUCCESS, ares_array_sort(NULL, NULL));
   EXPECT_NE(ARES_SUCCESS, ares_array_set_size(NULL, 0));
+
+  /* Overflow in the size calculation must be rejected, not wrapped */
+  ares_array_t *overflow_array = ares_array_create((SIZE_MAX / 2) + 1, NULL);
+  EXPECT_NE((void *)NULL, overflow_array);
+  EXPECT_EQ(ARES_ENOMEM, ares_array_set_size(overflow_array, 2));
+  EXPECT_EQ(ARES_ENOMEM, ares_array_set_size(overflow_array, SIZE_MAX));
+  ares_array_destroy(overflow_array);
+
+  /* Overflow must also be rejected in the malloc-style wrapper, and in
+   * the original-size arm of the realloc wrapper */
+  EXPECT_EQ(NULL, ares_malloc_zero_array(SIZE_MAX, 2));
+  EXPECT_EQ(NULL, ares_malloc_zero_array(2, SIZE_MAX));
+  EXPECT_EQ(NULL, ares_realloc_zero_array(NULL, SIZE_MAX, 1, 2));
 }
 
 TEST_F(LibraryTest, BufMisuse) {
@@ -1259,12 +2649,23 @@ TEST_F(LibraryTest, BufMisuse) {
   EXPECT_EQ(NULL, ares_buf_tag_fetch(NULL, NULL));
   EXPECT_EQ((size_t)0, ares_buf_tag_length(NULL));
   EXPECT_NE(ARES_SUCCESS, ares_buf_tag_fetch_bytes(NULL, NULL, NULL));
-  EXPECT_NE(ARES_SUCCESS, ares_buf_tag_fetch_string(NULL, NULL, 0));
+  EXPECT_NE(ARES_SUCCESS,
+            ares_buf_tag_fetch_string(NULL, NULL, 0, ARES_BUF_CHARSET_ASCII));
+  EXPECT_NE(ARES_SUCCESS,
+            ares_buf_tag_fetch_strdup(NULL, NULL, ARES_BUF_CHARSET_UTF8));
   EXPECT_NE(ARES_SUCCESS, ares_buf_fetch_bytes_dup(NULL, 0, ARES_FALSE, NULL));
-  EXPECT_NE(ARES_SUCCESS, ares_buf_fetch_str_dup(NULL, 0, NULL));
+  EXPECT_NE(ARES_SUCCESS,
+            ares_buf_fetch_str_dup(NULL, 0, NULL, ARES_BUF_CHARSET_ASCII));
   EXPECT_EQ((size_t)0, ares_buf_consume_whitespace(NULL, ARES_FALSE));
   EXPECT_EQ((size_t)0, ares_buf_consume_nonwhitespace(NULL));
   EXPECT_EQ((size_t)0, ares_buf_consume_line(NULL, ARES_FALSE));
+  EXPECT_NE(ARES_SUCCESS, ares_buf_append_codepoint(NULL, 0x41));
+  EXPECT_NE(ARES_SUCCESS, ares_buf_fetch_codepoint(NULL, NULL));
+  EXPECT_NE(ARES_SUCCESS, ares_buf_len_utf8(NULL, NULL));
+  EXPECT_EQ(ARES_FALSE, ares_buf_isprint(NULL));
+  EXPECT_EQ((size_t)0,
+            ares_buf_consume_last_charset(NULL, NULL, 0, ARES_FALSE));
+  EXPECT_EQ(SIZE_MAX, ares_buf_consume_last_charset(NULL, NULL, 0, ARES_TRUE));
   EXPECT_EQ(ARES_FALSE, ares_buf_begins_with(NULL, NULL, 0));
   EXPECT_EQ((size_t)0, ares_buf_get_position(NULL));
   EXPECT_NE(ARES_SUCCESS, ares_buf_set_position(NULL, 0));
@@ -1477,6 +2878,46 @@ TEST_F(LibraryTest, Array) {
     EXPECT_EQ(bufval, m->id);
   }
 
+  ares_array_destroy(a);
+}
+
+/* Regression: repeatedly claiming the first element drives the internal
+ * offset up to the allocation size.  Re-inserting afterwards must still
+ * succeed (previously ares_array_insert_at() failed with ARES_EFORMERR
+ * because compaction tried to move from an out-of-range source index). */
+TEST_F(LibraryTest, ArrayClaimFrontThenReuse) {
+  ares_array_t *a = ares_array_create(sizeof(size_t), NULL);
+  EXPECT_NE(nullptr, a);
+
+  for (size_t iter = 0; iter < 4; iter++) {
+    /* Fill exactly to the minimum allocation (ARES__ARRAY_MIN == 4) so a
+     * full front-drain later pushes offset to precisely alloc_cnt. */
+    for (size_t i = 0; i < 4; i++) {
+      size_t val = iter * 100 + i;
+      EXPECT_EQ(ARES_SUCCESS, ares_array_insertdata_last(a, &val));
+    }
+    EXPECT_EQ((size_t)4, ares_array_len(a));
+
+    /* Drain ALL elements from the front so offset climbs to alloc_cnt (the
+     * condition the fix guards); verify copy-out value and FIFO order. */
+    for (size_t i = 0; i < 4; i++) {
+      size_t out = 0;
+      EXPECT_EQ(ARES_SUCCESS, ares_array_claim_at(&out, sizeof(out), a, 0));
+      EXPECT_EQ(iter * 100 + i, out);
+    }
+    EXPECT_EQ((size_t)0, ares_array_len(a));
+
+    /* Array is now empty with offset == alloc_cnt; appending must still
+     * work, and the data must be readable back out. */
+    size_t *ptr = NULL;
+    EXPECT_EQ(ARES_SUCCESS, ares_array_insert_last((void **)&ptr, a));
+    EXPECT_NE(nullptr, ptr);
+    *ptr = 424242;
+    EXPECT_EQ((size_t)424242, *(size_t *)ares_array_at(a, 0));
+    EXPECT_EQ(ARES_SUCCESS, ares_array_remove_first(a));
+  }
+
+  EXPECT_EQ((size_t)0, ares_array_len(a));
   ares_array_destroy(a);
 }
 

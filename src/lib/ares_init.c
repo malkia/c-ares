@@ -102,6 +102,20 @@ static int server_sort_cb(const void *data1, const void *data2)
   if (s1->consec_failures > s2->consec_failures) {
     return 1;
   }
+
+  /* Among servers with the same failure count, prefer the one that failed
+   * least recently so that a server that went down long ago (and may have
+   * since recovered) is tried before one that just failed.  This also keeps
+   * retries rotating across servers once the failure counts saturate at
+   * SERVER_CONSEC_FAILURES_CAP.  Healthy servers all have a zeroed retry
+   * time and fall through to configuration order. */
+  if (s1->next_retry_time.sec != s2->next_retry_time.sec) {
+    return s1->next_retry_time.sec < s2->next_retry_time.sec ? -1 : 1;
+  }
+  if (s1->next_retry_time.usec != s2->next_retry_time.usec) {
+    return s1->next_retry_time.usec < s2->next_retry_time.usec ? -1 : 1;
+  }
+
   if (s1->idx < s2->idx) {
     return -1;
   }
@@ -485,10 +499,10 @@ int ares_dup(ares_channel_t **dest, const ares_channel_t *src)
   ares_channel_lock(src);
   /* Now clone the options that ares_save_options() doesn't support, but are
    * user-provided */
-  (*dest)->sock_create_cb               = src->sock_create_cb;
-  (*dest)->sock_create_cb_data          = src->sock_create_cb_data;
-  (*dest)->sock_config_cb               = src->sock_config_cb;
-  (*dest)->sock_config_cb_data          = src->sock_config_cb_data;
+  (*dest)->sock_create_cb      = src->sock_create_cb;
+  (*dest)->sock_create_cb_data = src->sock_create_cb_data;
+  (*dest)->sock_config_cb      = src->sock_config_cb;
+  (*dest)->sock_config_cb_data = src->sock_config_cb_data;
   memcpy(&(*dest)->sock_funcs, &(src->sock_funcs), sizeof((*dest)->sock_funcs));
   (*dest)->sock_func_cb_data            = src->sock_func_cb_data;
   (*dest)->legacy_sock_funcs            = src->legacy_sock_funcs;
@@ -605,8 +619,7 @@ int ares_set_sortlist(ares_channel_t *channel, const char *sortstr)
 }
 
 void ares_set_query_enqueue_cb(ares_channel_t       *channel,
-                               ares_query_enqueue_cb callback,
-                               void                 *user_data)
+                               ares_query_enqueue_cb callback, void *user_data)
 {
   if (channel == NULL) {
     return;

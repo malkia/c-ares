@@ -27,6 +27,8 @@
 
 #include "ares_private.h"
 
+#include <limits.h>
+
 #ifdef HAVE_SYS_PARAM_H
 #  include <sys/param.h>
 #endif
@@ -134,7 +136,8 @@ static ares_status_t parse_sort(ares_buf_t *buf, struct apattern *pat)
   }
 
   /* Fetch ip address */
-  status = ares_buf_tag_fetch_string(buf, ipaddr, sizeof(ipaddr));
+  status = ares_buf_tag_fetch_string(buf, ipaddr, sizeof(ipaddr),
+                                     ARES_BUF_CHARSET_ASCII);
   if (status != ARES_SUCCESS) {
     return status;
   }
@@ -163,15 +166,16 @@ static ares_status_t parse_sort(ares_buf_t *buf, struct apattern *pat)
     }
 
     /* Fetch mask */
-    status = ares_buf_tag_fetch_string(buf, maskstr, sizeof(maskstr));
+    status = ares_buf_tag_fetch_string(buf, maskstr, sizeof(maskstr),
+                                       ARES_BUF_CHARSET_ASCII);
     if (status != ARES_SUCCESS) {
       return status;
     }
 
     if (ares_str_isnum(maskstr)) {
       /* Numeric mask */
-      int mask = atoi(maskstr);
-      if (mask < 0 || mask > 128) {
+      unsigned int mask;
+      if (!ares_str_parse_uint(maskstr, 128, &mask)) {
         return ARES_EBADSTR;
       }
       if (pat->addr.family == AF_INET && mask > 32) {
@@ -315,6 +319,8 @@ static ares_status_t config_search(ares_sysconfig_t *sysconfig, const char *str,
   return ARES_SUCCESS;
 }
 
+/* UTF8 is permitted since values such as search domains may contain unicode
+ * (IDN) entries, which are converted to their punycode form after parsing */
 static ares_status_t buf_fetch_string(ares_buf_t *buf, char *str,
                                       size_t str_len)
 {
@@ -322,7 +328,7 @@ static ares_status_t buf_fetch_string(ares_buf_t *buf, char *str,
   ares_buf_tag(buf);
   ares_buf_consume(buf, ares_buf_len(buf));
 
-  status = ares_buf_tag_fetch_string(buf, str, str_len);
+  status = ares_buf_tag_fetch_string(buf, str, str_len, ARES_BUF_CHARSET_UTF8);
   return status;
 }
 
@@ -348,12 +354,17 @@ static ares_status_t config_lookup(ares_sysconfig_t *sysconfig, ares_buf_t *buf,
     const char *value = lookups[i];
     char        ch;
 
+    /* AIX /etc/netsvc.conf uses address-family-suffixed tokens such as
+     * "bind4"/"bind6" and "local4"/"local6" in addition to the bare forms. */
     if (ares_strcaseeq(value, "dns") || ares_strcaseeq(value, "bind") ||
+        ares_strcaseeq(value, "bind4") || ares_strcaseeq(value, "bind6") ||
         ares_strcaseeq(value, "resolv") || ares_strcaseeq(value, "resolve")) {
       ch = 'b';
     } else if (ares_strcaseeq(value, "files") ||
                ares_strcaseeq(value, "file") ||
-               ares_strcaseeq(value, "local")) {
+               ares_strcaseeq(value, "local") ||
+               ares_strcaseeq(value, "local4") ||
+               ares_strcaseeq(value, "local6")) {
       ch = 'f';
     } else {
       continue;
@@ -409,8 +420,11 @@ static ares_status_t process_option(ares_sysconfig_t *sysconfig,
 
   key = kv[0];
   if (num == 2) {
-    val    = kv[1];
-    valint = (unsigned int)strtoul(val, NULL, 10);
+    val = kv[1];
+    if (!ares_str_parse_uint(val, UINT_MAX, &valint)) {
+      status = ARES_EBADSTR;
+      goto done;
+    }
   }
 
   if (ares_streq(key, "ndots")) {
@@ -580,7 +594,14 @@ ares_status_t ares_sysconfig_parse_resolv_line(const ares_channel_t *channel,
     return ARES_SUCCESS;
   }
 
-  status = ares_buf_tag_fetch_string(line, option, sizeof(option));
+  /* The option keyword (search, domain, nameserver, ...) is ASCII by
+   * definition, but the value may contain UTF-8: unicode search domains are
+   * converted to their punycode form after all config sources are gathered.
+   * buf_fetch_string() therefore validates as UTF-8; values for options
+   * that can't legitimately contain unicode are rejected by their
+   * respective downstream parsers. */
+  status = ares_buf_tag_fetch_string(line, option, sizeof(option),
+                                     ARES_BUF_CHARSET_ASCII);
   if (status != ARES_SUCCESS) {
     return ARES_SUCCESS;
   }
@@ -736,13 +757,12 @@ done:
   return status;
 }
 
-
 ares_status_t ares_sysconfig_process_buf(const ares_channel_t    *channel,
                                          ares_sysconfig_t        *sysconfig,
                                          ares_buf_t              *buf,
                                          ares_sysconfig_line_cb_t cb)
 {
-  ares_array_t *lines  = NULL;
+  ares_array_t *lines = NULL;
   size_t        num;
   size_t        i;
   ares_status_t status;
