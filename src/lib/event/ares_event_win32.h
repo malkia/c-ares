@@ -157,14 +157,14 @@ typedef NTSTATUS(NTAPI *NtCreateFile_t)(
 #  endif
 
 
-#  ifndef HAVE_OVERLAPPED_ENTRY
-typedef struct _OVERLAPPED_ENTRY {
-  ULONG_PTR    lpCompletionKey;
-  LPOVERLAPPED lpOverlapped;
-  ULONG_PTR    Internal;
-  DWORD        dwNumberOfBytesTransferred;
-} OVERLAPPED_ENTRY, *LPOVERLAPPED_ENTRY;
-#  endif
+// #  ifndef HAVE_OVERLAPPED_ENTRY
+// typedef struct _OVERLAPPED_ENTRY {
+//   ULONG_PTR    lpCompletionKey;
+//   LPOVERLAPPED lpOverlapped;
+//   ULONG_PTR    Internal;
+//   DWORD        dwNumberOfBytesTransferred;
+// } OVERLAPPED_ENTRY, *LPOVERLAPPED_ENTRY;
+// #  endif
 
 #endif /* _WIN32 */
 
